@@ -1,20 +1,18 @@
-// Multi-recipient envelope for platform-blind agent memory (docs/encrypted-memory.md). A fresh per-write content
-// key (CEK) encrypts the blob; the CEK is wrapped once PER RECIPIENT, so the same ciphertext can be opened by any
-// recipient that holds its key:
+// Platform-blind agent memory envelope (docs/encrypted-memory.md). A fresh per-write content key (CEK) encrypts the
+// blob; the CEK is wrapped under the ONE recipient:
 //   - room: symmetric — AES-256-GCM under HKDF(mk,"memwrap"); `mk` is the CREATOR's high-entropy 32-byte key
 //     (lives in the room-link fragment, delivered to the agent over E2EE — the server never sees it).
-//   - beta: symmetric — the SAME wrap, but under the operator's per-room BETA key (betaKey.mjs). Present when beta
-//     mode is on, so a gift can be sealed to the creator (room) AND still opened by the operator (beta) for support
-//     — dual-recipient. Dropping beta = a true platform-blind room (creator-only).
-//   - admin (DEBUG only): asymmetric — RSA-OAEP-SHA256 under the operator's OFFLINE public key (private half off-AWS).
+//
+// There is NO operator recipient: a record is readable ONLY by whoever holds the creator key. (An earlier BETA
+// posture also sealed to an operator key + an offline admin RSA key for support; that was retired — support is now
+// the creator handing over their own mk. Old dual-sealed records still open here via their `room` recipient.)
 //
 // On-disk shape (replaces today's plaintext JSON.stringify(memory)):
-//   { v:1, iv, ct, recipients:{ room?:{iv,w}, beta?:{iv,w}, admin?:{kid,w} } }   (all bytes base64url)
+//   { v:1, iv, ct, recipients:{ room:{iv,w} } }   (all bytes base64url)
 //
-// Everything on disk is public ciphertext; `mk` (and the admin PRIVATE key) are the only secrets. open() fails
-// CLOSED (returns null ⇒ caller treats it as "no prior memory") on wrong key / tamper / malformed — mirroring
-// seal.mjs. mk is already high-entropy random, so the room wrap derives via HKDF (cheap), NOT seal.mjs's 210k-iter
-// PBKDF2 (that stays for any passphrase path).
+// Everything on disk is public ciphertext; `mk` is the only secret. open() fails CLOSED (returns null ⇒ caller
+// treats it as "no prior memory") on wrong key / tamper / malformed. mk is already high-entropy random, so the room
+// wrap derives via HKDF (cheap), NOT a 210k-iter PBKDF2 (that stays for any passphrase path).
 import { webcrypto as crypto } from 'node:crypto'
 
 const enc = new TextEncoder()
@@ -27,11 +25,6 @@ const ub64 = (s) => new Uint8Array(Buffer.from(String(s || ''), 'base64url'))
 async function roomWrapKey(mk) {
   const ikm = await crypto.subtle.importKey('raw', ub64(mk), 'HKDF', false, ['deriveKey'])
   return crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: enc.encode('memwrap') }, ikm, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt'])
-}
-// SPKI PEM (standard base64, with or without the -----BEGIN----- header) → an RSA-OAEP-SHA256 public key.
-async function importAdminPub(pem) {
-  const der = new Uint8Array(Buffer.from(String(pem).replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64'))
-  return crypto.subtle.importKey('spki', der, { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['encrypt'])
 }
 
 /** A fresh random room key (base64url) — what the creator mints + puts in the room-link fragment. */
@@ -75,11 +68,13 @@ export function combineShares(shareA, shareB) {
 export async function assembleRoomKey(shareA, shareB, expectedCommit) {
   const mk = combineShares(shareA, shareB)
   if (mk == null) return null
-  if (expectedCommit && (await commit(mk)) !== expectedCommit) return null
+  // §6.4: a multi-share reconstruction MUST be verified against the room commitment — never return an unchecked combined key.
+  if (!expectedCommit) return null
+  if ((await commit(mk)) !== expectedCommit) return null
   return mk
 }
 
-// Wrap the CEK under a symmetric room/beta key (HKDF(key,"memwrap")) → { iv, w }.
+// Wrap the CEK under the symmetric room key (HKDF(mk,"memwrap")) → { iv, w }.
 async function wrapSym(key, cek) {
   const wk = await roomWrapKey(key)
   const iv = crypto.getRandomValues(new Uint8Array(12))
@@ -87,53 +82,44 @@ async function wrapSym(key, cek) {
   return { iv: b64(iv), w: b64(w) }
 }
 
-/** Seal a string for one or more recipients. opts: { mk?, betaMk?, adminPubKey?, adminKid? } — at least one is
- *  required. room (mk) is the CREATOR/platform-blind reader; beta (betaMk) is the operator's per-room key so the
- *  same record stays operator-readable while beta mode is on (dual-recipient); admin (RSA pubkey) is the offline
- *  debug reader. A DEBUG session with no room key still seals (admin/beta-only) without breaking no-key-no-plaintext.
- *  Returns the envelope object (JSON-serializable). */
-export async function seal(plaintext, { mk, betaMk, adminPubKey, adminKid } = {}) {
-  if (!mk && !betaMk && !adminPubKey) throw new Error('seal needs at least one recipient (mk, betaMk, or adminPubKey)')
+/** Seal a string to the room key. opts: { mk } — required. `mk` is the CREATOR key and the ONLY recipient: the
+ *  record is platform-blind (no operator/admin reader). Returns the envelope object (JSON-serializable). */
+export async function seal(plaintext, { mk, aad = null } = {}) {
+  if (!mk) throw new Error('seal needs the room key (mk)')
   const cek = crypto.getRandomValues(new Uint8Array(32))
   const cekKey = await crypto.subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['encrypt'])
   const iv = crypto.getRandomValues(new Uint8Array(12))
-  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cekKey, enc.encode(String(plaintext))))
-  const recipients = {}
-  if (mk) recipients.room = await wrapSym(mk, cek) // creator / platform-blind reader
-  if (betaMk) recipients.beta = await wrapSym(betaMk, cek) // operator's per-room beta key (dual-recipient)
-  // admin recipient (asymmetric, RSA-OAEP) — debug/operator, decrypts OFFLINE with the private half
-  if (adminPubKey) {
-    const pub = await importAdminPub(adminPubKey)
-    const aw = new Uint8Array(await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, pub, cek))
-    recipients.admin = { kid: adminKid || '', w: b64(aw) }
-  }
-  return { v: VERSION, iv: b64(iv), ct: b64(ct), recipients }
+  const p = { name: 'AES-GCM', iv }
+  if (aad) p.additionalData = aad // M4: OPTIONAL context binding (ledger boxes pass {room,index}). A moved/replayed box → GCM auth fails on open. Non-ledger seals pass no aad → unchanged wire.
+  const ct = new Uint8Array(await crypto.subtle.encrypt(p, cekKey, enc.encode(String(plaintext))))
+  const recipients = { room: await wrapSym(mk, cek) } // creator — the only reader; platform-blind
+  return { v: VERSION, iv: b64(iv), ct: b64(ct), recipients, ...(aad ? { aad: 1 } : {}) } // aad:1 marks a bound box so the reader knows to supply the matching aad
 }
 
-/** Open an envelope with a symmetric key (mk) → the plaintext string, or null on wrong key / tamper / malformed.
- *  Tries the SAME key against every symmetric recipient (room, then beta), so ONE call opens the record whether the
- *  caller holds the creator's mk (room) or the operator's beta key (beta). Wrong key → GCM auth fails → next/null. */
-export async function open(envelope, { mk } = {}) {
+/** Open an envelope with the room key (mk) → the plaintext string, or null on wrong key / tamper / malformed.
+ *  Opens the `room` recipient (the only one written; a legacy record's extra recipients are ignored — mk still opens
+ *  its room slot). Wrong key → GCM auth fails → null. */
+export async function open(envelope, { mk, aad = null } = {}) {
   if (!isEnvelope(envelope) || !mk) return null
-  const wk = await roomWrapKey(mk)
-  for (const slot of ['room', 'beta']) {
-    const r = envelope.recipients[slot]
-    if (!r) continue
-    try {
-      const cek = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ub64(r.iv) }, wk, ub64(r.w)))
-      const cekKey = await crypto.subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['decrypt'])
-      const pt = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ub64(envelope.iv) }, cekKey, ub64(envelope.ct)))
-      return dec.decode(pt)
-    } catch {
-      // this recipient didn't match the key (or tamper) — try the next symmetric recipient, else fail closed
-    }
+  const r = envelope.recipients.room
+  if (!r) return null
+  if (envelope.aad && !aad) return null // M4: a bound box (aad:1) MUST be opened with its {room,index} aad — refuse to open it context-free
+  try {
+    const wk = await roomWrapKey(mk)
+    const cek = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ub64(r.iv) }, wk, ub64(r.w)))
+    const cekKey = await crypto.subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['decrypt'])
+    const p = { name: 'AES-GCM', iv: ub64(envelope.iv) }
+    if (envelope.aad) p.additionalData = aad // verify the box still sits at its sealed {room,index}; a legacy box (no marker) ignores any supplied aad
+    const pt = new Uint8Array(await crypto.subtle.decrypt(p, cekKey, ub64(envelope.ct)))
+    return dec.decode(pt)
+  } catch {
+    return null // wrong key / tamper / moved box → fail closed
   }
-  return null
 }
 
-/** True if a stored object is a v1 envelope (vs legacy pre-encryption plaintext). At least one recipient. */
+/** True if a stored object is a v1 envelope (vs legacy pre-encryption plaintext). Requires the `room` recipient. */
 export function isEnvelope(o) {
-  return !!(o && typeof o === 'object' && o.v === VERSION && typeof o.iv === 'string' && typeof o.ct === 'string' && o.recipients && (o.recipients.room || o.recipients.beta || o.recipients.admin))
+  return !!(o && typeof o === 'object' && o.v === VERSION && typeof o.iv === 'string' && typeof o.ct === 'string' && o.recipients && o.recipients.room)
 }
 
 // ── Binary sealing (keepsake clips/images) ──────────────────────────────────────────────────────────────────────
@@ -141,47 +127,37 @@ export function isEnvelope(o) {
 // than base64'd into JSON — so a multi-MB video isn't bloated ~33% or forced through a JSON parse. The small `header`
 // (the per-recipient wrapped CEK + the content IV) is JSON-serializable → store it as artifact metadata. Open with
 // openBytes(body, header, { mk }). Wire-compatible with witz/public/e2ee.js sealBytes/openBytes (browser ⇄ agent).
-export async function sealBytes(bytes, { mk, betaMk, adminPubKey, adminKid } = {}) {
-  if (!mk && !betaMk && !adminPubKey) throw new Error('sealBytes needs at least one recipient (mk, betaMk, or adminPubKey)')
+export async function sealBytes(bytes, { mk } = {}) {
+  if (!mk) throw new Error('sealBytes needs the room key (mk)')
   const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)
   const cek = crypto.getRandomValues(new Uint8Array(32))
   const cekKey = await crypto.subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['encrypt'])
   const iv = crypto.getRandomValues(new Uint8Array(12))
   const body = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cekKey, data))
-  const recipients = {}
-  if (mk) recipients.room = await wrapSym(mk, cek)
-  if (betaMk) recipients.beta = await wrapSym(betaMk, cek)
-  if (adminPubKey) {
-    const pub = await importAdminPub(adminPubKey)
-    const aw = new Uint8Array(await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, pub, cek))
-    recipients.admin = { kid: adminKid || '', w: b64(aw) }
-  }
+  const recipients = { room: await wrapSym(mk, cek) }
   return { header: { v: VERSION, alg: 'bin', iv: b64(iv), recipients }, body }
 }
 
-/** Open a sealBytes body + header with a symmetric key → plaintext BYTES (Uint8Array), or null on wrong key / tamper /
- *  malformed (fail-closed). Tries the key against room then beta, mirroring open(). */
+/** Open a sealBytes body + header with the room key → plaintext BYTES (Uint8Array), or null on wrong key / tamper /
+ *  malformed (fail-closed). Opens the `room` recipient, mirroring open(). */
 export async function openBytes(body, header, { mk } = {}) {
   if (!isBinHeader(header) || !mk || !body) return null
+  const r = header.recipients.room
+  if (!r) return null
   const data = body instanceof Uint8Array ? body : new Uint8Array(body)
-  const wk = await roomWrapKey(mk)
-  for (const slot of ['room', 'beta']) {
-    const r = header.recipients[slot]
-    if (!r) continue
-    try {
-      const cek = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ub64(r.iv) }, wk, ub64(r.w)))
-      const cekKey = await crypto.subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['decrypt'])
-      return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ub64(header.iv) }, cekKey, data))
-    } catch {
-      // wrong key / tamper for this slot → try the next symmetric recipient, else fail closed
-    }
+  try {
+    const wk = await roomWrapKey(mk)
+    const cek = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ub64(r.iv) }, wk, ub64(r.w)))
+    const cekKey = await crypto.subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['decrypt'])
+    return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ub64(header.iv) }, cekKey, data))
+  } catch {
+    return null // wrong key / tamper → fail closed
   }
-  return null
 }
 
 /** True if `h` is a v1 binary-envelope header (from sealBytes) — distinct from a string envelope (which carries `ct`). */
 export function isBinHeader(h) {
-  return !!(h && typeof h === 'object' && h.v === VERSION && h.alg === 'bin' && typeof h.iv === 'string' && h.recipients && (h.recipients.room || h.recipients.beta || h.recipients.admin))
+  return !!(h && typeof h === 'object' && h.v === VERSION && h.alg === 'bin' && typeof h.iv === 'string' && h.recipients && h.recipients.room)
 }
 
 // ── Sealed box (PUBLIC-KEY) — for CONTRIBUTOR wishes ──────────────────────────────────────────────────────────────

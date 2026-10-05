@@ -1,49 +1,59 @@
 # Witbitz — the render
 
-**This is the code that touches your plaintext.** In a Witbitz Space, messages are sealed at rest and the
-client is thin, so there is exactly one place data is ever decrypted: a transient, server-side *render*,
-invoked on an AI turn and on every changed read. That surface is small — a few hundred lines — and this
-repository is it, published to be **read**.
+**This is the code that touches your plaintext — and it runs inside an attested enclave.** Every room is sealed under
+its own room key (`mk`), which lives with the members, in the room link. To run an AI turn the room has to be opened;
+on Witbitz's confidential tier that happens only inside an always-on **AWS Nitro enclave**, whose exact build is
+published, reproducible, audited and pinned. Not the server relaying the request, and not us. This repository is that
+code, published to be **read**.
 
-> "Verify the code, not the operator" only means something when the code can be *read*, not just re-hashed.
-> A pinned build proves the bytes you run are the bytes certified; it says nothing about whether those bytes
-> are trustworthy. This is the other half.
+> "Verify the code, not the operator" only means something when the code can be *read*, not just re-hashed. The
+> enclave's measurements prove the bytes that run are the bytes published; this is where you read what they do.
+
+## The confidential tier — the enclave
+
+- **Always on.** One Nitro enclave serves every confidential room; there is no cold start and no fallback to a
+  non-enclave path.
+- **Sealed to the measured build.** The member's device seals `mk` to the enclave's attested key, so only the build
+  whose measurement is published can open the room. The relaying server only ever carries opaque bytes.
+- **Reproducible and pinned.** The payload (this code and its dependencies) is built deterministically and measured
+  into the enclave's PCRs; its network egress list is measured too. The published claim names those values —
+  [`enclave-claim.json`](https://witbitz-spaces.pages.dev/enclave-claim.json),
+  [`enclave-policy.json`](https://witbitz-spaces.pages.dev/enclave-policy.json) — and a client refuses an enclave
+  that does not match.
+- **Audited before it ships.** No build can be pinned without a passing audit verdict, and every verdict is published
+  in a hash-chained log: [`/audit/turn-enclave.jsonl`](https://witbitz-spaces.pages.dev/audit/turn-enclave.jsonl).
+- **Every reply is certified.** Each confidential reply carries a turn certificate signed inside the enclave (an RFC 9711
+  EAT), naming the build that produced it; the app verifies it against AWS's Nitro root.
 
 ## The surface
 
 | File | Lines | What it does |
 |---|---:|---|
-| [`envelope.mjs`](./envelope.mjs) | 287 | The seal/open primitive. A fresh per-write content key, wrapped **per recipient** — `room` symmetrically under `HKDF(mk)`, others via ECDH `sealTo`/`openBox`. There is **no operator/admin recipient** in production. |
-| [`asyncTurn.mjs`](./asyncTurn.mjs) | 228 | One decrypt-once turn: open the sealed ledger with `mk`, append the incoming message, ask the model, append the reply, re-seal, store — then drop `mk`. |
-| [`spacePoll.mjs`](./spacePoll.mjs) | 79 | The read side. The sealed blob never leaves the server; an unchanged read never decrypts (the etag is a hash of the *ciphertext*); a changed read returns only the **new** entries as plaintext, and needs `mk` to do it. |
-| [`sessionStore.mjs`](./sessionStore.mjs) | 243 | Session memory, sealed with `mk` — platform-blind, and fail-safe (no `mk` ⇒ nothing is written or read). |
+| [`envelope.mjs`](./envelope.mjs) | 263 | The seal/open primitive: a fresh content key per write, wrapped for the room under `HKDF(mk)` (AES-256-GCM); `sealTo`/`openBox` for a single recipient's public key. **There is no operator or admin recipient.** |
+| [`roomKey.mjs`](./roomKey.mjs) | 50 | Where `mk` lives while a request runs — per-request memory, cleared after it. |
+| [`spaceLedgerV3.mjs`](./spaceLedgerV3.mjs) | 111 | The ledger format: each entry is its own sealed box; every new box is bound to its room and position (the AES-GCM AAD), so it cannot be moved, duplicated or replayed undetected. |
+| [`asyncTurn.mjs`](./asyncTurn.mjs) | 825 | One AI turn: open the ledger with `mk`, add the incoming message, decide whether the assistant should reply, ask the model, append the reply, drop `mk`. |
+| [`spacePoll.mjs`](./spacePoll.mjs) | 187 | Reads. Content-blind (`pollsealed`): sealed boxes after the reader's position, no `mk`. Or opened (`poll`): the reader sends `mk` for the new entries. An unchanged read touches neither. |
+| [`sessionStore.mjs`](./sessionStore.mjs) | 1,040 | Storage: the ledger and the room's sealed side documents. No `mk`, no write. Appends are compare-and-set, so concurrent writers never lose each other's entries. |
+| [`ledgerSegments.mjs`](./ledgerSegments.mjs) | 166 | The ledger stored in segments, so an append rewrites one small object, not the history. Layout only — never a key or a byte of plaintext. |
 
-**594 lines** for the seal / turn / read core; **837** including session memory.
+**1,436 lines** for the seal / turn / read core; **2,642** with storage.
 
-## How to trust that this is what actually runs
+## The standard tier
 
-These files are a **readable mirror**. The hash-verified canonical is the full, reproducible bundle:
+Each app chooses a room's tier when it creates it. A room created on the standard tier runs the same code in the
+server's request handler instead of the enclave: the device sends `mk` with a request, the server holds it in memory
+for that request only, and stores nothing but ciphertext. Reading the code tells you what it does; it cannot prove the
+process is not observed while a room is open — which is exactly what the confidential tier is for.
 
-- **`source.tar.gz`** — <https://witbitz-spaces.pages.dev/source.tar.gz> — the exact render source, which
-  rebuilds **byte-for-byte** to the running Lambda's `CodeSha256`.
-- **`cert.json`** — <https://witbitz-spaces.pages.dev/cert.json> — a signed certificate binding the git
-  commit, that `CodeSha256`, and the egress allowlist to ground truth.
-- The step-by-step checks live in **verify.md**: <https://docs.witbitz.chat/docs/verify.md> (Tests 6–7).
+## How to check what runs
 
-So: read the logic here; confirm the deployed bytes match, yourself, via `source.tar.gz`.
+- **Confidential tier:** the enclave claim and policy above, the audit log, and each reply's turn certificate.
+- **Standard tier:** [`source.tar.gz`](https://witbitz-spaces.pages.dev/source.tar.gz) is the exact deployed server
+  source and rebuilds byte-for-byte to the running Lambda's `CodeSha256`; [`cert.json`](https://witbitz-spaces.pages.dev/cert.json)
+  binds the git commit, that hash and the page's network allow-list.
+- The checks, step by step: <https://docs.witbitz.chat/docs/verify.md> · the model: <https://docs.witbitz.chat/docs/trust-model.md>
 
-## Honest scope
-
-This is the *plaintext surface*, not a runnable app — these modules import orchestration code (the model
-adapter, config, storage) that lives in the full bundle. And reading the code proves what the code *does*,
-not that the running **process** can't be observed during that transient decrypt instant — that is the
-attested / TEE tier, the one rung still ahead. Everything up to *"the code is exactly this, and it's
-readable"* is here.
-
-## License
-
-[Apache-2.0](./LICENSE). See [NOTICE](./NOTICE).
-
----
-
-Part of [Witbitz](https://witbitz.chat) · docs at <https://docs.witbitz.chat>
+These files are a readable mirror of the repository at the commit named in [`SOURCE`](./SOURCE). They are the
+plaintext surface, not a runnable app: they import orchestration (model adapters, room configuration, the request
+handler) that ships in the full bundle and in the enclave payload.
