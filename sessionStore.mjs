@@ -475,8 +475,11 @@ export async function appendLedger(room, entries, { done, expectCount } = {}) {
   const add = Array.isArray(entries) ? entries.filter((e) => e && typeof e === 'object') : []
   if (!LEDGER_V3_WRITE) { // legacy whole-body writer: keep its semantics, just serialize the read-modify-write
     return withKeyLock(ledgerKey(room), async () => {
+      // ABSENT starts empty; UNREADABLE refuses. Writing [...nothing, ...add] over a history this key cannot open replaced
+      // the whole room with one line — a turn that began before an in-place re-key (agent/roomRekey.mjs) and answered
+      // after it, under the OLD key (2026-10-22, the members suite; the v3/v4 writers keep every box and were never hit)
       let cur = []
-      try { const d = await readLedgerDefinitive(room); if (d.ok) cur = d.entries } catch { /* absent/unreadable → start from what we have */ }
+      try { const d = await readLedgerDefinitive(room); if (!d.ok) return { ok: false, reason: d.reason === 'no_key' ? 'no_key' : 'unreadable' }; cur = d.entries } catch { return { ok: false, reason: 'unreadable' } }
       if (Number.isInteger(expectCount) && cur.length !== expectCount) return { ok: false, reason: 'stale', count: cur.length }
       const next = [...cur, ...add]
       const ok = await putLedger(room, next, { ...(done === 'all' ? { done: next.length } : Number.isInteger(done) ? { done: Math.min(done, next.length) } : {}) })
@@ -1027,6 +1030,20 @@ export async function putRaw(room, name, value) {
     console.log(`  raw(${name}) store failed:`, e && e.message)
     return false
   }
+}
+/** A raw doc and its version, for a compare-and-set write (putRawIf). → { value, etag } — value null when absent. */
+export async function getRawV(room, name) {
+  if (!memoryEnabled() || !PERSISTENT) return { value: null, etag: null }
+  const r = await readObjectV(rawKey(room, name))
+  if (r.body == null) return { value: null, etag: null }
+  let value = r.body
+  try { value = JSON.parse(r.body) } catch { /* a string */ }
+  return { value, etag: r.etag }
+}
+/** Write a raw doc ONLY if it is still at `etag` (null = must not exist). → true written | false (someone wrote first). */
+export async function putRawIf(room, name, value, etag) {
+  if (!memoryEnabled() || !PERSISTENT) return false
+  return writeObjectIf(rawKey(room, name), typeof value === 'string' ? value : JSON.stringify(value), etag || null)
 }
 /** Fetch a raw blob (parsed JSON, else the string), or null. UN-gated on the key — the blob is opaque ciphertext. */
 export async function getRaw(room, name) {

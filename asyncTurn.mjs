@@ -6,6 +6,7 @@
 // client's active window BEFORE this runs — the server never holds it, so the ledger is unreadable at rest and the
 // agent can only act while a member is present. Reuses the SAME mk-sealed ledger as the live call (putLedger/getLedger),
 // so an async Space and a live call share one conversation. Bounded; compaction is a later cut.
+import { isLaneCopy } from '../spaces/public/roomName.js' // the one rule for a lane copy of the shared room's lines
 import { runWithTurnUsage, turnUsageRecord } from './turnUsage.mjs' // the reply's sealed usage record (docs/tenant-billing.md § 8.1)
 import { runWithTurnEvidence, envStampSigner, certifyReply } from './turnCert.mjs' // the reply's signed TURN CERTIFICATE in an enclave (docs/turn-certificates.md)
 import { logRoom } from './logRoom.mjs' // a log names a room by a hash, never the id (the log privacy audit)
@@ -50,6 +51,9 @@ const OUT_OF_TIME_NOTE = 'I ran out of time on that one and stopped here. Ask ag
 // them equal (agent/addressedVectors.test.mjs). This file is the enforcer; the page is a prediction.
 import { addressesAgent } from './addressed.mjs'
 import { pendingProposals } from './delegatedAuthority.mjs' // a turn that proposed but said nothing names what is waiting
+import { lastSealedEntry } from './spacePoll.mjs' // the newest sealed entry rides the stream frame (frameTail)
+const FRAME_BOX_MAX = 40_000 // under roomStream's MAX_FRAME with the envelope's room; larger → the bare frame, the device polls
+async function frameTail (room) { try { const t = await lastSealedEntry(room); return t && typeof t.box === 'string' && t.box.length <= FRAME_BOX_MAX ? { count: t.count, box: t.box } : {} } catch { return {} } }
 
 /** "I've suggested X — it's waiting for your approval." for the actions a turn proposed without a word about them. */
 export function proposalNote(actions) {
@@ -112,6 +116,20 @@ const LANE_GUIDANCE = '\n\nYOU ARE A PRIVATE ASSISTANT IN A LINKED LANE. Your me
   + 'Markdown link (hotel → Booking.com search; anything else → Google Maps), EVERY time, exactly as you would in the '
   + 'shared room. Coaching your member privately is no reason to drop the underlined place-links — they help them here just as much.'
 
+// A lane whose room LEFT THE CROSSING OUT (sealed config platformTools without cross_to_shared; 2026-10-07): the same
+// private coaching, and an honest sentence instead of instructions for a tool it does not have.
+const LANE_GUIDANCE_NO_CROSS = '\n\nYOU ARE A PRIVATE ASSISTANT IN A LINKED LANE. Your member is also in a SEPARATE SHARED room with other people. '
+  + 'Everything you write here is seen by YOUR MEMBER ALONE — the other party never sees it. Messages labelled "from the shared room" are what the other party actually said.\n'
+  + 'You cannot send anything to the shared room, the other party, or anyone else. If your member asks you to send or post a message, say plainly that you cannot, and help them word it so they can send it themselves.'
+// QUESTIONS ABOUT THE APP GO TO HELP (the owner, 2026-10-14: "When a question about the app is written to a regular room the ai
+// should point to the helper"). The room's assistant does not know the app's screens; the Help Space answers from the guide and
+// links straight into them. A `[…](#help?q=…)` link points the person to Help — the app pulses ☰ → Help (space.js,
+// helpNav.markGoLinks), and they ask it there.
+export const APP_HELP_GUIDANCE = '\n\nQUESTIONS ABOUT THE APP ITSELF: if someone asks how to use Spaces — this app — (its settings, menus, features, '
+  + 'how to invite people, Siri, connections, notifications, backups, devices, the Code section, anything about the app rather than the topic of '
+  + 'the conversation), do not guess at its screens. Say in one short line that Help knows the app, and give a link that asks it: '
+  + '[Ask Help](#help?q=THE+QUESTION) with their question URL-encoded in place of THE+QUESTION, written in their language. '
+  + 'Answer only what you are sure of besides that, briefly. Questions about anything else are yours to answer as usual — never send those to Help.'
 const FILE_GUIDANCE = '\n\nWhen a participant shares a document — you will see a "[shared file: NAME]" marker in the conversation — you CANNOT see its contents until you call the read_file tool. Call read_file (pass the file `name` if several were shared) to read the document, then summarize, answer about, or quote it. Shared files stay readable in later turns too. Supported: PDF, Word (.docx), Excel (.xlsx), CSV, and text.'
 
 // Two halves, and for a long time only the second existed.
@@ -172,7 +190,13 @@ export function renderLedger(ledger, limit = CONTEXT_ENTRIES) {
     .filter((e) => e && ((typeof e.text === 'string' && e.text.trim()) || has(e.images) || has(e.files)))
     .slice(-limit)
     .map((e) => {
-      const who = e.name || (e.self ? 'you' : 'someone')
+      // A MIRRORED line says where it came from — the lane's persona and guidance promise lines "labeled 'from the shared
+      // room'", and nothing labeled them (sync sweep, 2026-10-10): the agent could not tell the other party from its member.
+      // The UI's rule (messageRender.js): only a LANE COPY (id `sh:…`) is the linked shared room's. An imported chat,
+      // a device-carried fork, a recreate-from-export and server-carried history also carry source:'shared' and are
+      // THIS room's own (sync sweep, 2026-10-10).
+      const fromShared = isLaneCopy(e)
+      const who = (e.name || (e.self ? 'you' : 'someone')) + (fromShared ? ' (from the shared room)' : '')
       // Split PICTURES from DOCUMENTS. They used to share one mark that ended "call read_file to read it" — but
       // read_file extracts TEXT (PDF/Word/Excel/CSV) and can only fail on a JPEG, so a photo in the chat pointed the
       // model at a tool guaranteed not to work and it concluded it could not access the picture. A photo's `alt` is
@@ -353,7 +377,7 @@ export async function recentLedgerImage(room, log, { getImageBlob: gib = getImag
 // Every turn runs inside a usage collector (turnUsage.mjs): what its model calls used rides in the AI reply, sealed.
 export function runAsyncTurn(room, incoming, opts = {}) { return runWithTurnUsage(() => runWithTurnEvidence(() => runAsyncTurnInner(room, incoming, opts))) }
 async function runAsyncTurnInner(room, incoming, opts = {}) {
-  const { respond = brainRespond, shouldReply = brainShouldReply, describeImage = brainDescribeImage, now = Date.now(), agentName = 'Assistant', persona = '', artifacts = [], producedFiles = [], producedSources = [], challengeJti, bridgeContext = '', turnInstructions = '', bridged = false, agentReplies = true, mode = 'auto', stopKey = '', participants = null, turnBudgetMs = null } = opts // config-less fallback = the generic Assistant, NOT a random 'Comedian' (an M1 leftover) — a room whose config didn't reach the turn (e.g. the enclave-tier config-seal gap) degrades sensibly. `stopKey` = the prompter's per-turn cancel nonce (see STOP below)
+  const { respond = brainRespond, shouldReply = brainShouldReply, describeImage = brainDescribeImage, now = Date.now(), agentName = 'Assistant', persona = '', offeredTools, artifacts = [], producedFiles = [], producedSources = [], challengeJti, bridgeContext = '', turnInstructions = '', bridged = false, agentReplies = true, mode = 'auto', stopKey = '', participants = null, turnBudgetMs = null, framing = '', showPrompt = false, pointToHelp = false } = opts // config-less fallback = the generic Assistant, NOT a random 'Comedian' (an M1 leftover) — a room whose config didn't reach the turn (e.g. the enclave-tier config-seal gap) degrades sensibly. `stopKey` = the prompter's per-turn cancel nonce (see STOP below)
   const stream = opts.roomStream ? roomStreamPublisher({ mk: getRoomKey(), gate: opts.roomStream === true ? null : opts.roomStream }) : null // off unless SPACE_STREAM_URL is set; a gated room passes { room, gen } and streams behind a grant
   const from = (incoming && incoming.from) || 'someone'
   let text = String((incoming && incoming.text) || '').trim()
@@ -459,7 +483,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   //   inline (storeAttachments never drops one) — the room must not lose a member's file because S3 hiccuped.
   const mkNow = getRoomKey()
   const [storedImages, storedFiles] = await Promise.all([storeAttachments(room, mkNow, images), storeAttachments(room, mkNow, files)])
-  log.push(prune({ kind: mcp ? 'mcp' : (hasMedia ? 'media' : 'text'), id: memberId, ts: now, name: from, replyTo, mcpName: mcp ? mcp.name : undefined, mcpArgs: mcp ? mcp.args : undefined, verified: incoming && incoming.verified ? true : undefined, user: incoming && incoming.verified && typeof incoming.user === 'string' && incoming.user ? incoming.user : undefined, spk: incoming && incoming.vspk ? incoming.vspk : undefined, md: incoming && incoming.md === true ? true : undefined, voice: incoming && incoming.voice && typeof incoming.voice === 'object' ? incoming.voice : undefined, text, images: storedImages.length ? storedImages : undefined, files: storedFiles.length ? storedFiles : undefined, widgets: locWidget ? [locWidget] : undefined }))
+  log.push(prune({ kind: mcp ? 'mcp' : (hasMedia ? 'media' : 'text'), id: memberId, ts: now, name: from, replyTo, mcpName: mcp ? mcp.name : undefined, mcpArgs: mcp ? mcp.args : undefined, verified: incoming && incoming.verified ? true : undefined, attestedClient: incoming && typeof incoming.attestedClient === 'string' && incoming.attestedClient ? incoming.attestedClient : undefined, attestedVersion: incoming && incoming.attestedClient && Number.isInteger(incoming.attestedVersion) ? incoming.attestedVersion : undefined, user: incoming && incoming.verified && typeof incoming.user === 'string' && incoming.user ? incoming.user : undefined, keyOnly: incoming && incoming.verified && incoming.keyOnly === true ? true : undefined, spk: incoming && incoming.vspk ? incoming.vspk : undefined, md: incoming && incoming.md === true ? true : undefined, voice: incoming && incoming.voice && typeof incoming.voice === 'object' ? incoming.voice : undefined, text, images: storedImages.length ? storedImages : undefined, files: storedFiles.length ? storedFiles : undefined, widgets: locWidget ? [locWidget] : undefined }))
   // PUBLISH the member's message NOW — before the brain runs — so the OTHER participants see it on their next poll instead
   // of waiting for the whole turn (the agent's reply can take many seconds). The reply is stored again at the end. Best-
   // effort: if this store fails, the final putLedger below is still the source of truth.
@@ -475,7 +499,11 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   let earlyOk = false
   try { const ap = await appendLedger(room, forStore([memberEntry])); earlyOk = !!(ap && ap.ok); if (!earlyOk) console.log('LEDGER early-publish FAILED — the member message is not stored yet: ' + ((ap && ap.reason) || 'unknown')) } catch (e) { console.log('LEDGER early-publish FAILED — the member message is not stored yet: ' + String((e && e.message) || e).slice(0, 200)) }
   const publishedAt = log.length
-  if (stream && earlyOk) stream.publish({ k: 'entries' }) // the member's message is in the ledger — everyone viewing polls it once
+  // ★ THE MESSAGE RIDES THE FRAME (2026-10-20, the owner: "The problem is mainly in the room I am watching. Why isn't it
+  //   immediate?"): the frame said only "poll", and a confidential room's poll waited in the enclave's queue (~5 s). Now it
+  //   carries the newest entry, still sealed with the room key, and its count — a device that holds count-1 draws it at
+  //   once (l1-worker.js frameTails) and still polls behind it. Too large, or no ledger: the bare frame, as before.
+  if (stream && earlyOk) stream.publish({ k: 'entries', ...(opts.noFrameTail ? {} : await frameTail(room)) }) // the member's message is in the ledger — everyone viewing draws it (or polls it once)
   // MIGRATE OLDER ENTRIES' inline attachments out of the ledger, a bounded amount per turn, in parallel with the reply
   // (S3 puts against an LLM wait — free latency). Only entries with an `id` are rewritable in place (rewriteLedgerEntries
   // finds them by id in the CURRENT stored ledger, so a box appended meanwhile by someone else is kept). Awaited before
@@ -545,7 +573,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   let quietCode = ''    // which of the two 'did not speak' causes this was
   if (mode === 'ondemand') { speak = addressed; if (!speak) quietCode = 'not_addressed' }
   else if (mode !== 'always') { // 'auto' (default)
-    // `source !== 'shared'` — a PRIVATE LANE mirrors the shared room's messages (docs/spaces-private-lane.md), which carry
+    // `!isLaneCopy(e)` (it was `source !== 'shared'` until 2026-10-10) — a PRIVATE LANE mirrors the shared room's messages (docs/spaces-private-lane.md), which carry
     // the SHARED participants' names. Counting them made a 1:1 lane look like a "group" (you + the mirrored others), so
     // `auto` ran the chime-in gate and stayed SILENT on a casual message — the assistant wouldn't answer you in your OWN
     // lane. The group-ness must reflect the lane's OWN speakers: exclude mirrored entries → a lane where only you speak is
@@ -564,7 +592,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
     // orthogonal flags on those kinds. `undefined` kind is LEGACY text (rooms from 2026-07-26 until `26276b6d` stamped
     // none), and excluding it would make every such group room read as solo — the opposite failure. Dated and
     // asserted in agent/speakerAllowlist.test.mjs, including the one test a denylist cannot have: an invented kind.
-    const speaks = (e) => e && !e.self && !e.sys && e.name && e.source !== 'shared' && (e.kind === undefined || SPEAKER_KINDS.has(e.kind))
+    const speaks = (e) => e && !e.self && !e.sys && e.name && !isLaneCopy(e) && (e.kind === undefined || SPEAKER_KINDS.has(e.kind)) // a lane copy is the shared room's; a recreated / forked group's own history counts (sync sweep, 2026-10-10)
     // ★★ THE ROSTER FIRST. A verified room knows who was admitted (`participants`, from the sealed allow-list via
     // spaceService → agent/rosterCount.mjs), so "is this a group" is answered by that number WHETHER OR NOT they have
     // spoken — the owner's rule (2026-09-21). None of the ledger-counting failures above can reach it. The ledger count
@@ -622,7 +650,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   // clock, so a stalled model call ran until Lambda killed the process and the room saw a turn that answered nothing.
   // Now the turn aborts its OWN model call at a budget below the Lambda's limit and finalizes exactly like a Stop: what
   // streamed lands, plus an honest note. (A synchronous block cannot be caught this way — data_query got its own worker
-  // deadline in dataTools.mjs for that.) SPACE_TURN_BUDGET_MS per environment; 120 s under prod's 150 s.
+  // deadline in dataTools.mjs for that.) SPACE_TURN_BUDGET_MS per environment; 240 s under prod's 300 s (it was 120 s under 150 s when written).
   const budgetMs = (Number.isFinite(turnBudgetMs) && turnBudgetMs > 0) ? turnBudgetMs : (Number(process.env.SPACE_TURN_BUDGET_MS) || 120_000)
   let timedOut = false
   const budgetTimer = setTimeout(() => { timedOut = true; console.log(`⏱️ TURN-BUDGET exceeded after ${budgetMs}ms — model call aborted, finalizing with what streamed`); try { abort.abort() } catch { /* */ } }, budgetMs)
@@ -644,11 +672,16 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   // { phase: 'writing' } — sealed under the room key like the text and written in the same record, so every member's
   // screen says "Working on it…" / "Searching places…" long before the first word. Never the model's thinking itself.
   let step = null, stepFlushed = '', stepBox = null, stepTimer = null, stepEnded = false
+  // ONE spelling of the status, for the write AND for "is there anything new" — the trailing check once compared a status
+  // WITHOUT `since` to the flushed one WITH it, never equal, so a turn re-wrote and re-streamed the same record every
+  // ~30 ms for its whole length (2,800 frames in a 90 s reply, measured 2026-10-13: the page redrew 30×/s, the enclave spent
+  // its CPUs on seals and writes).
+  const stepJson = () => (step ? JSON.stringify({ v: 1, ...step, since: stepSince }) : '')
   const flushPartial = () => {
     if (stepEnded) return // the turn has cleared its record — nothing may write it back
     if (partialInFlight) return // a write is already going; the trailing flush below catches whatever arrives meanwhile
     const snapshot = partialText
-    const stepNow = step ? JSON.stringify({ v: 1, ...step, since: stepSince }) : ''
+    const stepNow = stepJson()
     partialInFlight = (async () => {
       try {
         if (stepNow !== stepFlushed) { stepBox = stepNow ? JSON.stringify(await sealEnvelope(stepNow, { mk: getRoomKey() })) : null; stepFlushed = stepNow }
@@ -663,7 +696,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
         // TRAILING FLUSH. Deltas that arrived during the write were dropped by the guard above; without this the
         // reader watches the text stop growing and stay stale until the finished entry lands — which is exactly the
         // dead wait progressive replies exist to remove.
-        if (partialText !== partialFlushed || (step ? JSON.stringify({ v: 1, ...step }) : '') !== stepFlushed) flushPartial()
+        if (partialText !== partialFlushed || stepJson() !== stepFlushed) flushPartial()
       }
     })()
   }
@@ -701,6 +734,12 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   // arrives"). The platform knows for certain; the model's words are not evidence. Filled by makeProposingBrain as each
   // proposal is actually created, so a page can tell "a card is coming" from "the text only said so".
   const proposedThisTurn = []
+  // THE PROMPT THIS TURN SENT (showPrompt; builder mode's "a way to see the full prompt"): captured where the brain builds
+  // it (brain.respondWithTools onPrompt), so it is the exact text, not a reconstruction. Returned to the caller, never stored.
+  let sentPrompt = null
+  const builder = framing === 'builder' // builder mode: the app's persona only — none of the Spaces guidance below
+  // THE ROOM'S PLATFORM TOOLS (spaceService offeredPlatformNames): guidance only for what this turn offers. Absent = all.
+  const offers = (name) => !Array.isArray(offeredTools) || offeredTools.includes(name)
   step = { phase: 'thinking' }; flushPartial() // "Working on it…" on every member's screen from the first poll, not after the model's first word
   // HEARTBEAT: a model can think for a minute without a single write. Rewriting the record every 10 s keeps its `at`
   // fresh, and the poll drops a status older than 45 s — so a turn that died without clearing cannot leave a
@@ -713,6 +752,8 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
       onProposed: (p) => { proposedThisTurn.push(p) },
       signal: abort.signal, // STOP: aborting this rejects the model fetch → the tool loop ends; we finalize with the streamed text below
       onCitations: (cites) => { for (const c of (cites || [])) sources.push(c) },
+      ...(builder ? { framing: 'builder' } : {}),
+      ...(showPrompt ? { onPrompt: (p) => { sentPrompt = p } } : {}),
       longform: true, // an async Space is a TEXT chat, not a spoken turn → allow a full multi-paragraph answer (not the 320-char voice clip)
       agentName, // the Space's own name for its assistant ("Site Assistant"), so the prompt never names it by the platform default
       request: mcp
@@ -720,8 +761,8 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
         : (text || (files.length ? `I shared a document (${files.map((f) => f.name || 'file').join(', ')}). Read it with read_file and give me a short summary.` : 'Take a look at what I just shared.')), // media-only turn → a nudge so the model engages the file/pixels
       speaker: from,
       ...(turnInstructions ? { turnInstructions } : {}), // the app's per-turn instructions — never stored, see brain.buildPrompt
-      context: ctxText + widgetCtx + (bridgeContext ? '\n\n' + bridgeContext : ''), // compacted (summary + window) or the last-window; + the SHARED room on a bridged lane turn
-      guidance: persona + PLACES_GUIDANCE + PHOTO_GUIDANCE + FORMAT_GUIDANCE + (files.length ? FILE_GUIDANCE : '') + (bridged ? LANE_GUIDANCE : ''),
+      context: ctxText + widgetCtx + (bridgeContext ? '\n\n' + bridgeContext : '') + (files.length && offers('read_file') ? FILE_GUIDANCE : ''), // compacted (summary + window) or the last-window; + the SHARED room on a bridged lane turn; + the shared-file note AFTER the conversation, so a file turn keeps the cached prefix
+      guidance: builder ? persona : persona + (offers('search_places') || offers('show_places') || offers('add_place') ? PLACES_GUIDANCE : '') + (offers('show_photo') ? PHOTO_GUIDANCE : '') + FORMAT_GUIDANCE + (pointToHelp ? APP_HELP_GUIDANCE : '') + (bridged ? (offers('cross_to_shared') ? LANE_GUIDANCE : LANE_GUIDANCE_NO_CROSS) : ''),
       images: perceivedImages, // perceived natively (brainTools → image_url / input_image)
       // NOTE: shared FILES (documents) are deliberately NOT sent natively — the model reads them via read_file (see
       // FILE_GUIDANCE). They're still stored in the ledger entry above so read_file can reach them now and later.
@@ -818,8 +859,9 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   // the reader can see with no entry coming, and that has to disappear too.
   stepEnded = true; clearInterval(stepTimer); try { await partialInFlight } catch { /* */ } // no progress write may land after the clear
   try { await putPartial(room, null, ++partialSeq) } catch { /* */ }
-  if (stream) { stream.publish({ k: 'entries' }); stream.publish({ k: 'end' }); await stream.flush() } // the finished reply, then "no reply in progress"
+  if (stream) { stream.publish({ k: 'entries', ...(opts.noFrameTail ? {} : await frameTail(room)) }); stream.publish({ k: 'end' }); await stream.flush() } // the finished reply, then "no reply in progress"
   if (stopKey) { try { await putStopSig(room, null) } catch { /* */ } } // clear the cancel marker so a stale one can't affect a later turn
-  if (notStored) return { reply, entries: bounded.length, stopped, timedOut, proposed: proposedThisTurn, notStored: true, storeReason: (stored && stored.reason) || 'unknown' }
-  return { reply, entries: bounded.length, stopped, timedOut, proposed: proposedThisTurn }
+  if (notStored) return { reply, entries: bounded.length, stopped, timedOut, proposed: proposedThisTurn, notStored: true, storeReason: (stored && stored.reason) || 'unknown', ...(turnRecord ? { usage: turnRecord } : {}), ...(sentPrompt ? { prompt: sentPrompt } : {}) }
+  // `usage`: the same record the reply entry carries (a builder measures a turn from send()'s answer — Tomer, 2026-10-10)
+  return { reply, entries: bounded.length, stopped, timedOut, proposed: proposedThisTurn, ...(turnRecord ? { usage: turnRecord } : {}), ...(sentPrompt ? { prompt: sentPrompt } : {}) }
 }

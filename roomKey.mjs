@@ -34,6 +34,20 @@ export const getRoomKey = () => {
 }
 export const hasRoomKey = () => !!getRoomKey()
 
+// OLDER KEYS of a room re-keyed in place (docs/key-rotation-design.md § (b)): what was written before the rotation is
+// sealed under its earlier keys, which the room's config (sealed under the current key) carries. They are tied to the
+// key they were read with — `open` falls back to them only when it is asked to open with THAT key — and live only as
+// long as the request's scope (module scope: the session case, where one room is served).
+let older = new Map()
+const olderMap = () => { const s = scope(); if (s) { if (!s.older) s.older = new Map(); return s.older } return older }
+export const setOlderKeys = (forKey, keys) => {
+  const k = norm(forKey); if (!k) return
+  const m = olderMap(); const list = Array.isArray(keys) ? keys.map(norm).filter((x) => x && x !== k) : []
+  if (list.length) m.set(k, list); else m.delete(k)
+  if (m.size > 32) m.delete(m.keys().next().value) // module scope in a warm process: bounded
+}
+export const getOlderKeys = (forKey) => { const k = norm(forKey); return (k && olderMap().get(k)) || [] }
+
 /** True if the sealing key is set — the gate for persisting at all. (Kept as `hasAnyKey` for its call sites; the
  *  room key is now the only key.) */
 export const hasAnyKey = () => !!getRoomKey()
@@ -46,5 +60,5 @@ export const hasAnyKey = () => !!getRoomKey()
  * key could seal with whatever the last one left behind, which is the failure this exists to prevent.
  */
 export function runWithKeyScope(fn) {
-  return als.run({ mk: null }, fn)
+  return als.run({ mk: null, older: new Map() }, fn)
 }

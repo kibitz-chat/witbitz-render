@@ -63,6 +63,17 @@ async function readLedgerForPoll(room, sinceEtag, deps) {
   return { sealed: v.body, etag: v.tag ? tagEtag(v.tag) : await etagOf(v.body) }
 }
 
+/** The room's NEWEST sealed entry and the ledger's count — what a notification carries so a tap needs no read (2026-10-20, the
+ *  owner: a tapped message waited for the network; in a room that requires sign-in the push handler cannot read at all).
+ *  Content-blind: the box stays sealed with the room key. → { count, box } | null (no ledger, or not the v3 shape). */
+export async function lastSealedEntry(room, deps = {}) {
+  const read = await readLedgerForPoll(room, undefined, deps).catch(() => null)
+  if (!read || read.sealed == null) return null
+  let p; try { p = typeof read.sealed === 'string' ? JSON.parse(read.sealed) : read.sealed } catch { return null }
+  if (!p || !Array.isArray(p.boxes) || !p.boxes.length) return null
+  return { count: p.boxes.length, box: p.boxes[p.boxes.length - 1] }
+}
+
 /** Poll a Space, PROCESSED IN THE LAMBDA. The blob is never returned — only plaintext entries the Lambda decrypts.
  *   { status:200, etag, changed:false, entries:[] }        — unchanged since `sinceEtag` (NO decrypt, mk unused)
  *   { status:200, etag, changed:true, version, entries }   — the new plaintext entries after `sinceCount`

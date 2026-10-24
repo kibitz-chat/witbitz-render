@@ -14,6 +14,7 @@
 // treats it as "no prior memory") on wrong key / tamper / malformed. mk is already high-entropy random, so the room
 // wrap derives via HKDF (cheap), NOT a 210k-iter PBKDF2 (that stays for any passphrase path).
 import { webcrypto as crypto } from 'node:crypto'
+import { getRoomKey, getOlderKeys } from './roomKey.mjs' // a room re-keyed in place: its earlier keys, for what was sealed before (open/openBytes)
 
 const enc = new TextEncoder()
 const dec = new TextDecoder()
@@ -100,6 +101,14 @@ export async function seal(plaintext, { mk, aad = null } = {}) {
  *  Opens the `room` recipient (the only one written; a legacy record's extra recipients are ignored — mk still opens
  *  its room slot). Wrong key → GCM auth fails → null. */
 export async function open(envelope, { mk, aad = null } = {}) {
+  const pt = await openWith(envelope, mk, aad)
+  if (pt != null || !mk || mk !== getRoomKey()) return pt
+  // A ROOM RE-KEYED IN PLACE (docs/key-rotation-design.md § (b)): opened with the request's CURRENT key, a box sealed
+  // before the rotation opens with an earlier key from the room's chain (roomKey.setOlderKeys). Only for that key.
+  for (const k of getOlderKeys(mk)) { const o = await openWith(envelope, k, aad); if (o != null) return o }
+  return null
+}
+async function openWith(envelope, mk, aad) {
   if (!isEnvelope(envelope) || !mk) return null
   const r = envelope.recipients.room
   if (!r) return null
@@ -141,6 +150,12 @@ export async function sealBytes(bytes, { mk } = {}) {
 /** Open a sealBytes body + header with the room key → plaintext BYTES (Uint8Array), or null on wrong key / tamper /
  *  malformed (fail-closed). Opens the `room` recipient, mirroring open(). */
 export async function openBytes(body, header, { mk } = {}) {
+  const out = await openBytesWith(body, header, mk)
+  if (out != null || !mk || mk !== getRoomKey()) return out
+  for (const k of getOlderKeys(mk)) { const o = await openBytesWith(body, header, k); if (o != null) return o } // a re-keyed room's earlier keys (open, above)
+  return null
+}
+async function openBytesWith(body, header, mk) {
   if (!isBinHeader(header) || !mk || !body) return null
   const r = header.recipients.room
   if (!r) return null
