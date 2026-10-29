@@ -32,12 +32,12 @@ code, published to be **read**.
 | [`envelope.mjs`](./envelope.mjs) | 278 | The seal/open primitive: a fresh content key per write, wrapped for the room under `HKDF(mk)` (AES-256-GCM); `sealTo`/`openBox` for a single recipient's public key. **There is no operator or admin recipient.** |
 | [`roomKey.mjs`](./roomKey.mjs) | 64 | Where `mk` lives while a request runs — per-request memory, cleared after it. |
 | [`spaceLedgerV3.mjs`](./spaceLedgerV3.mjs) | 111 | The ledger format: each entry is its own sealed box; every new box is bound to its room and position (the AES-GCM AAD), so it cannot be moved, duplicated or replayed undetected. |
-| [`asyncTurn.mjs`](./asyncTurn.mjs) | 867 | One AI turn: open the ledger with `mk`, add the incoming message, decide whether the assistant should reply, ask the model, append the reply, drop `mk`. |
+| [`asyncTurn.mjs`](./asyncTurn.mjs) | 883 | One AI turn: open the ledger with `mk`, add the incoming message, decide whether the assistant should reply, ask the model, append the reply, drop `mk`. |
 | [`spacePoll.mjs`](./spacePoll.mjs) | 198 | Reads. Content-blind (`pollsealed`): sealed boxes after the reader's position, no `mk`. Or opened (`poll`): the reader sends `mk` for the new entries. An unchanged read touches neither. |
 | [`sessionStore.mjs`](./sessionStore.mjs) | 1,057 | Storage: the ledger and the room's sealed side documents. No `mk`, no write. Appends are compare-and-set, so concurrent writers never lose each other's entries. |
 | [`ledgerSegments.mjs`](./ledgerSegments.mjs) | 166 | The ledger stored in segments, so an append rewrites one small object, not the history. Layout only — never a key or a byte of plaintext. |
 
-**1,518 lines** for the seal / turn / read core; **2,741** with storage.
+**1,534 lines** for the seal / turn / read core; **2,757** with storage.
 
 ## The standard tier
 

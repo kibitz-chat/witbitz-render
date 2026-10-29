@@ -1,1 +1,1 @@
-kibitz-chat/witbitz @ 21a1c320ab95577626f001fc37731412d01eb036 (agent/*.mjs at that commit — the turn enclave live since 2026-10-23, PCR16 9d691601…, audit verdict in /audit/turn-enclave.jsonl)
+kibitz-chat/witbitz @ 5ec2b34a686fe8fd53d52a1b577c62c52d1ea302 (agent/*.mjs at that commit — the turn enclave audited 2026-10-29, PCR16 86cdbc08…, audit verdict in /audit/turn-enclave.jsonl)

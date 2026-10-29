@@ -442,6 +442,21 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   const replayKey = challengeJti ? `chal:${challengeJti}` : (incoming && incoming.sig ? `sig:${createHash('sha256').update(String(incoming.sig)).digest('base64url').slice(0, 22)}` : null)
   const memberId = replayKey || `async:${now}`
   if (replayKey && log.some((e) => e && e.id === memberId)) return { reply: '', entries: log.length, replayed: true }
+  // VISITOR LIMITS (docs/visitor-limits.md): a question asked without a user token in a site that limits them is counted
+  // HERE — after the room's lease (a busy resend never reaches this) and the replay check, BEFORE the replay claim (a refused
+  // question's retry must not find its id taken — 409 replay), before anything is stored and
+  // before any model runs (the image description included). Only when a model will run: an on-demand message that does not
+  // @-mention the assistant (or a muted assistant's room) costs nothing and is not counted. Over the limit, or with no count
+  // to be had, the refusal is the answer and the room is untouched — never a free question.
+  if (typeof opts.beforeModel === 'function') {
+    const describes = process.env.SPACE_IMAGE_DESCRIBE !== '0' && images.length > 0
+    const answers = agentReplies !== false && (!!mcp || mode !== 'ondemand' || addressesAgent(text, agentName, { mentionOnly: true }))
+    if (describes || answers) {
+      let g = null
+      try { g = await opts.beforeModel() } catch { g = null }
+      if (!g || g.ok !== true) return { reply: '', entries: log.length, refused: g && g.ok === false && g.error ? g : { status: 503, error: 'visitor_count_unavailable', reason: 'This site could not count your question just now — try again in a moment.' } }
+    }
+  }
   // ★ AND CLAIM IT before anything runs (the independent review, 2026-10-05): the check above reads a snapshot, so two
   // copies of one signed message sent together both passed it and both ran the model. The claim is a compare-and-set on
   // the room's sealed claims doc — one copy wins, the other is a replay. A store that cannot answer refuses the turn:
@@ -451,6 +466,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
     try { claimed = await claimTurnId(room, memberId) } catch (e) { const err = new Error('turn claim unavailable — ' + String((e && e.message) || e).slice(0, 120)); err.code = 'store_unavailable'; throw err }
     if (!claimed) return { reply: '', entries: log.length, replayed: true }
   }
+
 
   // Location share: a member dropped their CURRENT-location pin. Seal it into the shared `location` doc (both members'
   // location widgets poll it) and tag THIS entry with a location card so it renders for everyone. The town label is
