@@ -512,8 +512,13 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   // turn) is never overwritten, and this entry is never lost to theirs. `publishedAt` marks what this turn has stored so
   // far; the final write below appends only what came after it.
   const memberEntry = log[log.length - 1]
+  // A message CERTAIN to stay quiet — the assistant muted, or On demand with no @-mention — and with nothing to describe:
+  // its turn completes with this write. So the "turn completed" mark rides the same append (no second read-and-rewrite of
+  // the room's history at the end), and the model's context (widgetContext: three docs) is never read (2026-11-05, the
+  // owner: "Why a simple message turn takes 2s?" — the history was read three times and rewritten twice per message).
+  const quietEarly = !hasMedia && !mcp && (agentReplies === false || (mode === 'ondemand' && !addressesAgent(text, agentName, { mentionOnly: true })))
   let earlyOk = false
-  try { const ap = await appendLedger(room, forStore([memberEntry])); earlyOk = !!(ap && ap.ok); if (!earlyOk) console.log('LEDGER early-publish FAILED — the member message is not stored yet: ' + ((ap && ap.reason) || 'unknown')) } catch (e) { console.log('LEDGER early-publish FAILED — the member message is not stored yet: ' + String((e && e.message) || e).slice(0, 200)) }
+  try { const ap = await appendLedger(room, forStore([memberEntry]), quietEarly ? { done: 'all' } : undefined); earlyOk = !!(ap && ap.ok); if (!earlyOk) console.log('LEDGER early-publish FAILED — the member message is not stored yet: ' + ((ap && ap.reason) || 'unknown')) } catch (e) { console.log('LEDGER early-publish FAILED — the member message is not stored yet: ' + String((e && e.message) || e).slice(0, 200)) }
   const publishedAt = log.length
   // ★ THE MESSAGE RIDES THE FRAME (2026-10-20, the owner: "The problem is mainly in the room I am watching. Why isn't it
   //   immediate?"): the frame said only "poll", and a confidential room's poll waited in the enclave's queue (~5 s). Now it
@@ -553,7 +558,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   // to change them. Sourced from the FULL log + fresh getDoc (see widgetContext), so it is independent of the compacted
   // conversation window above: trimming/compacting chat never drops a widget the room still holds, and the itinerary is
   // pinned in even past the last-few window. Guarded (key is live here); no widget → empty string.
-  const widgetCtx = await widgetContext(room, log)
+  const widgetCtx = quietEarly ? '' : await widgetContext(room, log) // a quiet message runs no model: nothing to fold in
   // SMART CHIME-IN: in a GROUP (2+ distinct human speakers), if the message isn't directly aimed at the agent (no name /
   // @-mention), a DEDICATED cheap gate decides whether it should reply — biased hard to silence, and ISOLATED from the
   // "be helpful" reply framing that otherwise drags it into answering people talking to each other. SILENT → post nothing
@@ -572,7 +577,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   // elsewhere here — `error` is the code, `reason` is the sentence), and the facts the decision was made on ride
   // along. Never the message text: a diagnostic must not become a second copy of the content. agent/silentReason.test.mjs
   const quiet = (b, code, reason, facts = {}) => ({ reply: '', entries: b.length, silent: true, silentReason: code, reason, ...facts })
-  if (agentReplies === false) { if (descP) await descP; const b = forStore(log); await resolved(room, memberEntry, descChanged); return quiet(b, 'agent_muted', 'This room is an observing venue — its assistant never replies here. That is how the room was created, not a failure.') }
+  if (agentReplies === false) { if (descP) await descP; const b = forStore(log); if (!(quietEarly && earlyOk && !descChanged)) await resolved(room, memberEntry, descChanged); return quiet(b, 'agent_muted', 'This room is an observing venue — its assistant never replies here. That is how the room was created, not a failure.') }
   // RESPONSE MODE — a user control in the composer (default 'auto' → behavior unchanged from before this).
   //   'always'   — reply to every message.
   //   'ondemand' — reply ONLY when the message addresses the agent (name / @-mention); otherwise post it silently.
@@ -638,7 +643,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
       if (stream) { try { stream.publish({ k: 'end' }); await stream.flush() } catch { /* */ } }
     }
     if (descP) await descP
-    const b = forStore(log); await resolved(room, memberEntry, descChanged)
+    const b = forStore(log); if (!(quietEarly && earlyOk && !descChanged)) await resolved(room, memberEntry, descChanged) // marked done with the message already
     // `speakers` is the smoking gun when the count is wrong for the room — someone seeing 2 on a room they know holds
     // one person learns more from that number than from any sentence we could write.
     const why = quietCode === 'not_addressed'
