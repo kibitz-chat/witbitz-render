@@ -11,7 +11,7 @@ import { createHash, randomUUID } from 'node:crypto' // the local store's ETag e
 import { seal, open, isEnvelope } from './envelope.mjs'
 import { getRoomKey, setRoomKey, hasAnyKey } from './roomKey.mjs'
 import { isV3, sealEntry, openEntry, readLedgerEntries, ledgerAad } from './spaceLedgerV3.mjs'
-import { parseV4Header, readAllSegments, tailTag, tagFromTail, writeGeneration, appendOnce, rewriteSegments, touchHeader } from './ledgerSegments.mjs' // v4: the ledger in segments (docs/ledger-segments.md)
+import { parseV4Header, readAllSegments, tailTag, tagFromTail, writeGeneration, appendOnce, closeGeneration, rewriteSegments, touchHeader } from './ledgerSegments.mjs' // v4: the ledger in segments (docs/ledger-segments.md)
 import { notifForEntry } from './notif.mjs' // Phase-4: seal the newest entry's preview under NK for content-free-but-rich push
 
 const BUCKET = process.env.MEMORY_BUCKET || ''
@@ -320,7 +320,7 @@ async function headEtag(key) {
   try { const { client, HeadObjectCommand } = await s3api(); return (await client.send(new HeadObjectCommand({ Bucket: bucketFor(key), Key: key }))).ETag || null }
   catch (e) { if (isAbsentErr(e)) return null; throw e }
 }
-const ledgerIo = (room) => ({ headerKey: ledgerKey(room), segKey: (gen, i) => segKey(room, gen, i), read: readObjectV, writeIf: writeObjectIf, head: headEtag })
+const ledgerIo = (room) => ({ headerKey: ledgerKey(room), segKey: (gen, i) => segKey(room, gen, i), read: readObjectV, writeIf: writeObjectIf, write: writeObject, head: headEtag })
 /** The stored ledger body as every reader expects it: a v4 header is ASSEMBLED into the v3 shape { v:3, boxes, done };
  *  anything else is returned as stored. Throws when a v4 segment is missing — never a shorter room. */
 async function assembleLedger(room, body) {
@@ -398,8 +398,9 @@ async function putLedgerV3(room, snapshot, { done, reseal } = {}) {
   const entries = ledgerEntries(snapshot)
   if (!Array.isArray(entries)) return false
   try {
-    let prevRaw = null
-    try { prevRaw = await readObject(ledgerKey(room)) } catch { prevRaw = null } // fresh room → readObject throws ENOENT → no prior ledger
+    let prevRaw = null, prevTag = null
+    try { const v = await readObjectV(ledgerKey(room)); prevRaw = v.body; prevTag = v.etag } catch { prevRaw = null; prevTag = undefined } // fresh room → no prior ledger (undefined tag = could not read: no conditional rebuild)
+    const prevHeader = prevRaw != null ? parseV4Header(prevRaw) : null // a segmented ledger: its appends never touch this header (closeGeneration below)
     if (prevRaw != null) prevRaw = await assembleLedger(room, prevRaw) // a v4 room: its boxes, assembled (a missing segment THROWS → no write)
     let prevBoxes = []
     let prevDone = null
@@ -439,7 +440,34 @@ async function putLedgerV3(room, snapshot, { done, reseal } = {}) {
     const body = SEGMENTS_WRITE // a REBUILD: a whole new generation, then the header (the old one is never referenced again)
       ? JSON.stringify(await writeGeneration(ledgerIo(room), boxes, Number.isInteger(nextDone) ? nextDone : undefined))
       : JSON.stringify({ v: 3, boxes, ...(Number.isInteger(nextDone) ? { done: nextDone } : {}) })
-    const ok = await writeObject(ledgerKey(room), body)
+    // ⛔ A REBUILD REPLACES THE LEDGER ONLY IF NOBODY WROTE SINCE ITS READ (2026-11-07, the implicit-state-machine review): the
+    //   header was written blind, so an entry another writer appended meanwhile — landed by appendLedger's compare-and-set into
+    //   the old generation (or the old v3 body) — was dropped with that generation, and its writer had been told `ok`. Now the
+    //   header goes only over the version this rebuild read; a conflict writes nothing and answers false (the caller retries
+    //   or says so: the mirror's next pass, the react op's 503). The new generation's segments are left unreferenced.
+    if (prevTag === undefined) return false // the read failed: nothing to be conditional on, so no blind replace either
+    let ok = false
+    if (prevHeader) { // SEGMENTED: close the old generation over what was read, then switch the header (a hint update is retried)
+      const closed = await closeGeneration(ledgerIo(room), prevHeader, prevBoxes.length)
+      if (!closed.ok) { console.log('  v4 ledger rebuild refused: an entry was appended since it was read (kept)'); return false }
+      // the switch, within the close's lease (ledgerSegments SWITCH_DEADLINE_MS): past it an append may reopen the generation, so
+      // this rebuild no longer may replace it; a throw or a refusal reopens it at once (a crash leaves it to the lease)
+      let tag = prevTag
+      try {
+        for (let t = 0; t < 4 && !ok && closed.mayStillSwitch(); t++) {
+          ok = await writeObjectIf(ledgerKey(room), body, tag)
+          if (ok) break
+          const cur = await readObjectV(ledgerKey(room)); const h = parseV4Header(cur.body)
+          if (!h || h.gen !== prevHeader.gen) break // another rebuild switched it first: it stands
+          if ((Number(h.rev) || 0) !== (Number(prevHeader.rev) || 0)) break // an EDIT touched it (rewriteLedgerEntries' touchHeader): this rebuild was built without it (S#7)
+          tag = cur.etag // only the segment-count hint moved (the generation is closed: no entry can have landed)
+        }
+      } catch (e) { ok = false; console.log('  v4 ledger rebuild: the header switch failed:', e && e.message) }
+      if (!ok) { try { await closed.reopen() } catch { /* the lease reopens it (an append past REOPEN_AFTER_MS) */ } console.log('  v4 ledger rebuild refused: the header did not switch; the old generation reopened'); return false }
+    } else {
+      ok = await writeObjectIf(ledgerKey(room), body, prevTag) // v3 / absent: an append rewrites this one object, so its tag tells
+      if (!ok) { console.log('  v3 ledger rebuild refused: the ledger changed since it was read (a concurrent append kept)'); return false }
+    }
     // Phase-4 (flag-gated): seal the NEWEST entry's preview under NK = HKDF(mk,'notif') so the Service Worker composes a
     // rich push WITHOUT the room mk. Only on a real new tail entry (never a reseal / no-op), best-effort — the ledger
     // write never fails for a notif error. NK can't open the ledger, so this stores no room-master authority.
@@ -573,15 +601,25 @@ export async function rewriteLedgerEntries(room, replace) {
   if (read.body == null) return 0
   const v4 = parseV4Header(read.body)
   if (v4) { // segment by segment, a CAS each — the other segments are never rewritten
+    // ⛔ AN EDIT LANDS IN THE GENERATION THE ROOM READS (2026-11-08, docs/state-machines.md I16 / S#7): a rebuild switching the header
+    //   while this ran left the edit (a reaction, an attachment's new place) in the superseded generation — lost, and reported done.
+    //   After the edit the header is read again: another generation → the edit is made again there (a rebuild in flight sees the
+    //   header's `rev` move and gives up — putLedgerV3). Still moving after three passes → 0: not done.
     try {
-      const n = await rewriteSegments(ledgerIo(room), v4, async (box, i) => {
-        const aad = ledgerAad(room, i)
-        const e = await openEntry(box, { mk, aad }); if (e == null) return null
-        const next = await replace(e, i); if (!next) return null
-        return sealEntry(next, { mk, aad: LEDGER_AAD_WRITE ? aad : null })
-      })
-      if (n) { try { await touchHeader(ledgerIo(room)) } catch { /* the edit stands; peers see it on the next change */ } } // the poll tag must move: peers refresh reactions on "changed, nothing new"
-      return n
+      let gen = v4
+      for (let pass = 0; pass < 3; pass++) {
+        const n = await rewriteSegments(ledgerIo(room), gen, async (box, i) => {
+          const aad = ledgerAad(room, i)
+          const e = await openEntry(box, { mk, aad }); if (e == null) return null
+          const next = await replace(e, i); if (!next) return null
+          return sealEntry(next, { mk, aad: LEDGER_AAD_WRITE ? aad : null })
+        })
+        if (n) { try { await touchHeader(ledgerIo(room)) } catch { /* the edit stands; peers see it on the next change */ } } // the poll tag must move: peers refresh reactions on "changed, nothing new"
+        let now = null; try { now = parseV4Header((await readObjectV(ledgerKey(room))).body) } catch { now = null }
+        if (!now || now.gen === gen.gen) return n
+        gen = now // switched under the edit: make it again where the room reads
+      }
+      return 0
     } catch (e) { console.log('  ledger rewrite failed:', e && e.message); return 0 }
   }
   let p = null

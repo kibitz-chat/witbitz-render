@@ -384,6 +384,10 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   const images = sanitizeMedia(incoming && incoming.images, MAX_IMAGES)
   const files = sanitizeMedia(incoming && incoming.files, MAX_FILES, MAX_FILE_B64)
   const hasMedia = images.length > 0 || files.length > 0
+  // A CONTINUATION (the 2026-10-23 live test, finding 3): the approver's device asks the assistant to go on after an approved call ran
+  // and its result was said in the room. It adds NO member message, always answers, and runs once per card (`cont:<id>`, claimed
+  // below). spaceService admits it only for a card ranProposal finds (approved + ran, recently) — never as text from anyone.
+  const cont = incoming && typeof incoming.cont === 'string' && incoming.cont ? String(incoming.cont).slice(0, 120) : null
   // App→agent MCP CALL (parsed + whitelisted in spaceHandler): a declared skill the embedded app invoked over the bridge,
   // NOT a chat message. Stored as a `kind:'mcp'` ledger entry the MODEL sees + acts on this turn (renderLedger surfaces
   // it; request below directs it), but the chat UI + embed events never render it. Sealed + exportable like any entry.
@@ -429,7 +433,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   // (cost / context bound). For v2 both are the same trimmed array, so `forStore` is behaviour-neutral off the flag.
   const forStore = (l) => (ledgerV3WriteEnabled() ? l : (l.length > MAX_ENTRIES ? l.slice(-MAX_ENTRIES) : l))
   const forModel = (l) => (l.length > MAX_ENTRIES ? l.slice(-MAX_ENTRIES) : l)
-  if (!text && !hasMedia) return { reply: '', entries: log.length }
+  if (!text && !hasMedia && !cont) return { reply: '', entries: log.length }
 
   // SINGLE-USE challenge (anti-replay): the turn op verified the challenge is authentic + fresh; here we enforce it's
   // used ONCE. The accepted entry is stamped `id: 'chal:<jti>'`, so a replay of the same (challenge, turn, signature)
@@ -439,7 +443,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   // deduped against the sealed ledger — not only when requireChallenge is on. Two genuinely-different messages differ in
   // ts/id → different sig → different key, so this never merges distinct turns. Open/unsigned turns keep async:<now>
   // (no identity to dedup on, and open mode admits any mk-holder anyway).
-  const replayKey = challengeJti ? `chal:${challengeJti}` : (incoming && incoming.sig ? `sig:${createHash('sha256').update(String(incoming.sig)).digest('base64url').slice(0, 22)}` : null)
+  const replayKey = cont ? `cont:${cont}` : challengeJti ? `chal:${challengeJti}` : (incoming && incoming.sig ? `sig:${createHash('sha256').update(String(incoming.sig)).digest('base64url').slice(0, 22)}` : null)
   const memberId = replayKey || `async:${now}`
   if (replayKey && log.some((e) => e && e.id === memberId)) return { reply: '', entries: log.length, replayed: true }
   // VISITOR LIMITS (docs/visitor-limits.md): a question asked without a user token in a site that limits them is counted
@@ -450,7 +454,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   // to be had, the refusal is the answer and the room is untouched — never a free question.
   if (typeof opts.beforeModel === 'function') {
     const describes = process.env.SPACE_IMAGE_DESCRIBE !== '0' && images.length > 0
-    const answers = agentReplies !== false && (!!mcp || mode !== 'ondemand' || addressesAgent(text, agentName, { mentionOnly: true }))
+    const answers = agentReplies !== false && (!!cont || !!mcp || mode !== 'ondemand' || addressesAgent(text, agentName, { mentionOnly: true }))
     if (describes || answers) {
       let g = null
       try { g = await opts.beforeModel() } catch { g = null }
@@ -499,7 +503,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   //   inline (storeAttachments never drops one) — the room must not lose a member's file because S3 hiccuped.
   const mkNow = getRoomKey()
   const [storedImages, storedFiles] = await Promise.all([storeAttachments(room, mkNow, images), storeAttachments(room, mkNow, files)])
-  log.push(prune({ kind: mcp ? 'mcp' : (hasMedia ? 'media' : 'text'), id: memberId, ts: now, name: from, replyTo, mcpName: mcp ? mcp.name : undefined, mcpArgs: mcp ? mcp.args : undefined, verified: incoming && incoming.verified ? true : undefined, attestedClient: incoming && typeof incoming.attestedClient === 'string' && incoming.attestedClient ? incoming.attestedClient : undefined, attestedVersion: incoming && incoming.attestedClient && Number.isInteger(incoming.attestedVersion) ? incoming.attestedVersion : undefined, user: incoming && incoming.verified && typeof incoming.user === 'string' && incoming.user ? incoming.user : undefined, keyOnly: incoming && incoming.verified && incoming.keyOnly === true ? true : undefined, spk: incoming && incoming.vspk ? incoming.vspk : undefined, md: incoming && incoming.md === true ? true : undefined, voice: incoming && incoming.voice && typeof incoming.voice === 'object' ? incoming.voice : undefined, text, images: storedImages.length ? storedImages : undefined, files: storedFiles.length ? storedFiles : undefined, widgets: locWidget ? [locWidget] : undefined }))
+  if (!cont) log.push(prune({ kind: mcp ? 'mcp' : (hasMedia ? 'media' : 'text'), id: memberId, ts: now, name: from, replyTo, mcpName: mcp ? mcp.name : undefined, mcpArgs: mcp ? mcp.args : undefined, verified: incoming && incoming.verified ? true : undefined, attestedClient: incoming && typeof incoming.attestedClient === 'string' && incoming.attestedClient ? incoming.attestedClient : undefined, attestedVersion: incoming && incoming.attestedClient && Number.isInteger(incoming.attestedVersion) ? incoming.attestedVersion : undefined, user: incoming && incoming.verified && typeof incoming.user === 'string' && incoming.user ? incoming.user : undefined, keyOnly: incoming && incoming.verified && incoming.keyOnly === true ? true : undefined, spk: incoming && incoming.vspk ? incoming.vspk : undefined, md: incoming && incoming.md === true ? true : undefined, voice: incoming && incoming.voice && typeof incoming.voice === 'object' ? incoming.voice : undefined, text, images: storedImages.length ? storedImages : undefined, files: storedFiles.length ? storedFiles : undefined, widgets: locWidget ? [locWidget] : undefined }))
   // PUBLISH the member's message NOW — before the brain runs — so the OTHER participants see it on their next poll instead
   // of waiting for the whole turn (the agent's reply can take many seconds). The reply is stored again at the end. Best-
   // effort: if this store fails, the final putLedger below is still the source of truth.
@@ -511,20 +515,21 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   // whatever anyone else appended since this turn read the room — a concurrent write from another member (or another
   // turn) is never overwritten, and this entry is never lost to theirs. `publishedAt` marks what this turn has stored so
   // far; the final write below appends only what came after it.
-  const memberEntry = log[log.length - 1]
+  const memberEntry = cont ? null : log[log.length - 1] // a continuation adds no member message
   // A message CERTAIN to stay quiet — the assistant muted, or On demand with no @-mention — and with nothing to describe:
   // its turn completes with this write. So the "turn completed" mark rides the same append (no second read-and-rewrite of
   // the room's history at the end), and the model's context (widgetContext: three docs) is never read (2026-11-05, the
   // owner: "Why a simple message turn takes 2s?" — the history was read three times and rewritten twice per message).
-  const quietEarly = !hasMedia && !mcp && (agentReplies === false || (mode === 'ondemand' && !addressesAgent(text, agentName, { mentionOnly: true })))
+  const quietEarly = !cont && !hasMedia && !mcp && (agentReplies === false || (mode === 'ondemand' && !addressesAgent(text, agentName, { mentionOnly: true })))
   let earlyOk = false
-  try { const ap = await appendLedger(room, forStore([memberEntry]), quietEarly ? { done: 'all' } : undefined); earlyOk = !!(ap && ap.ok); if (!earlyOk) console.log('LEDGER early-publish FAILED — the member message is not stored yet: ' + ((ap && ap.reason) || 'unknown')) } catch (e) { console.log('LEDGER early-publish FAILED — the member message is not stored yet: ' + String((e && e.message) || e).slice(0, 200)) }
+  if (cont) earlyOk = true // nothing of the member's to publish: the reply is the only new entry
+  else try { const ap = await appendLedger(room, forStore([memberEntry]), quietEarly ? { done: 'all' } : undefined); earlyOk = !!(ap && ap.ok); if (!earlyOk) console.log('LEDGER early-publish FAILED — the member message is not stored yet: ' + ((ap && ap.reason) || 'unknown')) } catch (e) { console.log('LEDGER early-publish FAILED — the member message is not stored yet: ' + String((e && e.message) || e).slice(0, 200)) }
   const publishedAt = log.length
   // ★ THE MESSAGE RIDES THE FRAME (2026-10-20, the owner: "The problem is mainly in the room I am watching. Why isn't it
   //   immediate?"): the frame said only "poll", and a confidential room's poll waited in the enclave's queue (~5 s). Now it
   //   carries the newest entry, still sealed with the room key, and its count — a device that holds count-1 draws it at
   //   once (l1-worker.js frameTails) and still polls behind it. Too large, or no ledger: the bare frame, as before.
-  if (stream && earlyOk) stream.publish({ k: 'entries', ...(opts.noFrameTail ? {} : await frameTail(room)) }) // the member's message is in the ledger — everyone viewing draws it (or polls it once)
+  if (stream && earlyOk && !cont) stream.publish({ k: 'entries', ...(opts.noFrameTail ? {} : await frameTail(room)) }) // the member's message is in the ledger — everyone viewing draws it (or polls it once)
   // MIGRATE OLDER ENTRIES' inline attachments out of the ledger, a bounded amount per turn, in parallel with the reply
   // (S3 puts against an LLM wait — free latency). Only entries with an `id` are rewritable in place (rewriteLedgerEntries
   // finds them by id in the CURRENT stored ledger, so a box appended meanwhile by someone else is kept). Awaited before
@@ -577,6 +582,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   // elsewhere here — `error` is the code, `reason` is the sentence), and the facts the decision was made on ride
   // along. Never the message text: a diagnostic must not become a second copy of the content. agent/silentReason.test.mjs
   const quiet = (b, code, reason, facts = {}) => ({ reply: '', entries: b.length, silent: true, silentReason: code, reason, ...facts })
+  if (agentReplies === false && cont) return { reply: '', entries: log.length } // a muted assistant never continues — nothing of anyone's was written
   if (agentReplies === false) { if (descP) await descP; const b = forStore(log); if (!(quietEarly && earlyOk && !descChanged)) await resolved(room, memberEntry, descChanged); return quiet(b, 'agent_muted', 'This room is an observing venue — its assistant never replies here. That is how the room was created, not a failure.') }
   // RESPONSE MODE — a user control in the composer (default 'auto' → behavior unchanged from before this).
   //   'always'   — reply to every message.
@@ -586,7 +592,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   // An MCP skill invocation is a DIRECT, typed call to the agent (app.invoke) — always answer it. Otherwise the chime-in
   // gate below can silence a SECOND invoke: once the agent has replied, the room looks like a 2-speaker "group" and the
   // ⚙ chip isn't addressed by name, so it stays silent (broke re-invoke / a second search or re-curate).
-  const addressed = !!mcp || addressesAgent(text, agentName, { mentionOnly: mode === 'ondemand' }) // ondemand: an explicit @-mention only — talking ABOUT the assistant is not talking TO it
+  const addressed = !!cont || !!mcp || addressesAgent(text, agentName, { mentionOnly: mode === 'ondemand' }) // ondemand: an explicit @-mention only — talking ABOUT the assistant is not talking TO it
   let speak = true
   let decidingP = null, decidingSeq = 0 // Auto's "Deciding whether to reply…" status while its gate runs (below)
   let speakers = null   // distinct HUMAN speakers, computed only on the 'auto' path — reported so a wrong room shape is visible
@@ -777,7 +783,9 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
       ...(showPrompt ? { onPrompt: (p) => { sentPrompt = p } } : {}),
       longform: true, // an async Space is a TEXT chat, not a spoken turn → allow a full multi-paragraph answer (not the 320-char voice clip)
       agentName, // the Space's own name for its assistant ("Site Assistant"), so the prompt never names it by the platform default
-      request: mcp
+      request: cont
+        ? `${from} approved the call you proposed, and it has run: its result is the newest tool line in the conversation above. Continue now — use that result to answer what was asked (if the call failed, say so plainly and what can be done). Do not say the call is still waiting for approval.`
+        : mcp
         ? `The app has invoked your "${mcp.name}" MCP skill (a typed tool call over the bridge, NOT a chat message) with arguments: ${JSON.stringify(mcp.args)}. Handle it NOW using your tools, then reply with one short line.`
         : (text || (files.length ? `I shared a document (${files.map((f) => f.name || 'file').join(', ')}). Read it with read_file and give me a short summary.` : 'Take a look at what I just shared.')), // media-only turn → a nudge so the model engages the file/pixels
       speaker: from,

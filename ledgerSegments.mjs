@@ -106,8 +106,69 @@ export async function writeGeneration (io, boxes, done) {
 
 /** ONE append attempt on a v4 ledger. `seal(entry, index)` → box. → { ok:true, count } | { ok:false, reason:'conflict'|'stale', count? }.
  *  `done`: 'all' | integer | undefined (carried), monotonic, as appendLedger documents. */
-export async function appendOnce (io, header, headerEtag, add, { seal, done, expectCount } = {}) {
+/**
+ * ⛔ CLOSE A GENERATION BEFORE A REBUILD REPLACES IT (2026-11-07, the implicit-state-machine review). An append writes only the
+ * tail segment (or creates the next one) — never the header — so a rebuild's conditional header write cannot see it, and an
+ * entry appended between the rebuild's read and its header switch was dropped with the old generation. This closes the old one
+ * first, conditionally on what the rebuild read (`expectCount` boxes): the tail is re-written `closed` over the version read
+ * (an append that landed there since makes it fail), and an empty `closed` segment is created in the next slot (an append that
+ * opened that slot since makes it fail). Then every append meets a closed tail and re-reads the header (appendOnce).
+ * → { ok:true, reopen() } (reopen: the generation takes appends again — for a header switch that did not happen) | { ok:false }
+ */
+// ⛔ A CLOSE IS A LEASE, NOT A LOCK (2026-11-08, the state-machine document, S1): a rebuild that closed the generation and then
+// never switched the header — its header write threw, its process was killed, its write hung — left the closed marker for
+// ever, and every append after it refused: the room could never be written again. The marker now carries when it was written.
+// The rebuild may switch the header only within SWITCH_DEADLINE_MS of it (sessionStore putLedgerV3); an append that meets a
+// marker older than REOPEN_AFTER_MS reopens it — by then no rebuild may still switch, so the reopened generation is the room's.
+export const SWITCH_DEADLINE_MS = 20_000
+export const REOPEN_AFTER_MS = 60_000
+export async function closeGeneration (io, header, expectCount, { now = Date.now } = {}) {
   const tail = await readTail(io, header)
+  const count = tail ? tail.seg.from + tail.seg.boxes.length : 0
+  if (count !== expectCount) return { ok: false, reason: 'changed', count }
+  // ⛔ BOTH MARKERS CARRY THE LEASE (2026-11-09, docs/state-machines.md S#13): the tail was marked closed with no time, so a close
+  // that died before its sentinel (a throw, a killed process) left a closed tail WITH boxes that no lease could ever reopen.
+  const closedAt = now()
+  if (tail && !(await io.writeIf(io.segKey(header.gen, tail.i), JSON.stringify({ ...tail.seg, closed: true, closedAt }), tail.etag))) return { ok: false, reason: 'changed' }
+  const next = tail ? tail.i + 1 : 0, sentinelKey = io.segKey(header.gen, next)
+  const sentinel = { v: LEDGER_V4, i: next, from: count, boxes: [], ...(tail && Number.isInteger(tail.seg.done) ? { done: tail.seg.done } : {}) }
+  if (!(await io.writeIf(sentinelKey, JSON.stringify({ ...sentinel, closed: true, closedAt }), null))) return { ok: false, reason: 'changed' } // an append opened that slot: its segment is the tail now, open
+  // reopen: the sentinel is the LAST segment, and only the last one's `closed` is read — an open, empty one takes appends again.
+  //   ⛔ Only a sentinel that is STILL closed (S#15): past the lease an append may already have reopened it and landed an entry;
+  //   a blind rewrite of the empty sentinel erased that acknowledged entry.
+  // mayStillSwitch: the rebuild's lease — false once SWITCH_DEADLINE_MS have passed since the close (an append may reopen soon)
+  const reopen = async () => {
+    const r = await io.read(sentinelKey)
+    if (r.body == null) return false
+    const seg = JSON.parse(r.body)
+    if (!seg.closed) return false // reopened already (by an append past the lease): leave what it holds
+    const { closed: _c, closedAt: _a, ...open } = seg
+    return io.writeIf(sentinelKey, JSON.stringify(open), r.etag)
+  }
+  return { ok: true, closedAt, reopen, mayStillSwitch: () => now() - closedAt < SWITCH_DEADLINE_MS }
+}
+
+export async function appendOnce (io, header, headerEtag, add, { seal, done, expectCount, now = Date.now } = {}) {
+  const tail = await readTail(io, header)
+  if (tail && tail.seg.closed) { // a rebuild closed this generation (closeGeneration): re-read the header…
+    // …unless the rebuild never switched it and its lease is long over (or the marker predates the lease): reopen, then retry
+    // A tail WITH boxes is closed only when the close died before its sentinel (S#13): it reopens the same way. A marker with no
+    // time predates the lease (or that half-done close of older code): long over.
+    const at = Number(tail.seg.closedAt) || 0
+    if (now() - at > REOPEN_AFTER_MS) {
+      // ⛔ MOVE THE HEADER FIRST (2026-11-09, S#14): a rebuild that passed mayStillSwitch could have its header write still in
+      //   flight; landing after this reopen, it switched the room to a generation without what was appended here. Bumping the
+      //   header's rev over the version read makes that late write fail (its tag is gone) and tells the rebuild an edit happened.
+      //   A header that moved since (switched, edited) refuses this bump: re-read it, reopen nothing.
+      try {
+        if (headerEtag && await io.writeIf(io.headerKey, JSON.stringify({ ...header, rev: (Number(header.rev) || 0) + 1 }), headerEtag)) {
+          const { closed: _c, closedAt: _a, ...open } = tail.seg
+          await io.writeIf(io.segKey(header.gen, tail.i), JSON.stringify(open), tail.etag)
+        }
+      } catch { /* the next attempt tries again */ }
+    }
+    return { ok: false, reason: 'conflict' }
+  }
   const count = tail ? tail.seg.from + tail.seg.boxes.length : 0
   if (Number.isInteger(expectCount) && count !== expectCount) return { ok: false, reason: 'stale', count }
   const prevDone = tail && Number.isInteger(tail.seg.done) ? tail.seg.done : undefined
