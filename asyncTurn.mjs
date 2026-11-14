@@ -584,7 +584,8 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   const quiet = (b, code, reason, facts = {}) => ({ reply: '', entries: b.length, silent: true, silentReason: code, reason, ...facts })
   if (agentReplies === false && cont) return { reply: '', entries: log.length } // a muted assistant never continues — nothing of anyone's was written
   if (agentReplies === false) { if (descP) await descP; const b = forStore(log); if (!(quietEarly && earlyOk && !descChanged)) await resolved(room, memberEntry, descChanged); return quiet(b, 'agent_muted', 'This room is an observing venue — its assistant never replies here. That is how the room was created, not a failure.') }
-  // RESPONSE MODE — a user control in the composer (default 'auto' → behavior unchanged from before this).
+  // RESPONSE MODE — the room's setting (spaceService resolves it: the stored mode, else the turn's, else the app's default —
+  // roomSettings.js roomDefaultReplyMode; 'auto' here only when the room stores it, a turn asks for it, or a caller passes none).
   //   'always'   — reply to every message.
   //   'ondemand' — reply ONLY when the message addresses the agent (name / @-mention); otherwise post it silently.
   //   'auto'     — smart chime-in: reply if solo or addressed; in a GROUP not aimed at the agent, a cheap brain gate decides.
@@ -654,7 +655,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
     // one person learns more from that number than from any sentence we could write.
     const why = quietCode === 'not_addressed'
       ? `The assistant replies only when @-mentioned in this room (reply mode “ondemand”) — write ${agentName ? `“@${String(agentName).replace(/\s+/g, '')}”` : '“@ai”'} or “@ai” to get an answer; talking about it does not count.`
-      : `${speakers} people have spoken in this room, and this message did not address the assistant, so it stayed out of the conversation (reply mode “auto”). Set the reply mode to “always” if it should answer every message.`
+      : `${speakers} people have spoken in this room, and this message did not address the assistant, so it stayed out of the conversation (reply mode “auto” — a setting only apps built on the Witbitz SDK choose; the Spaces app offers Always and On demand). Set the reply mode to “always” if it should answer every message, or “on demand” to answer only when @-mentioned.`
     return quiet(b, quietCode, why, { mode, ...(speakers != null ? { speakers } : {}), ...(speakersFrom ? { speakersFrom } : {}) })
   }
   // PROGRESSIVE REPLY. Text is sealed and published as it is generated so a reader can start reading before the turn
