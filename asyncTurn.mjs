@@ -51,6 +51,7 @@ const OUT_OF_TIME_NOTE = 'I ran out of time on that one and stopped here. Ask ag
 // them equal (agent/addressedVectors.test.mjs). This file is the enforcer; the page is a prediction.
 import { addressesAgent } from './addressed.mjs'
 import { pendingProposals } from './delegatedAuthority.mjs' // a turn that proposed but said nothing names what is waiting
+import { frankEntry } from './franking.mjs' // a report Witbitz can check and nobody else can (docs/report-and-block.md §2)
 import { lastSealedEntry } from './spacePoll.mjs' // the newest sealed entry rides the stream frame (frameTail)
 const FRAME_BOX_MAX = 40_000 // under roomStream's MAX_FRAME with the envelope's room; larger → the bare frame, the device polls
 async function frameTail (room) { try { const t = await lastSealedEntry(room); return t && typeof t.box === 'string' && t.box.length <= FRAME_BOX_MAX ? { count: t.count, box: t.box } : {} } catch { return {} } }
@@ -515,6 +516,9 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   // whatever anyone else appended since this turn read the room — a concurrent write from another member (or another
   // turn) is never overwritten, and this entry is never lost to theirs. `publishedAt` marks what this turn has stored so
   // far; the final write below appends only what came after it.
+  // FRANKED (franking.mjs): what the server saw arrive — room, id, time, the text's hash, who (their verified email, @username, the key
+  // that signed) — sealed for Witbitz alone, inside the entry. A report of this message is then provable to us, and to nobody else.
+  if (!cont) log[log.length - 1] = await frankEntry(room, log[log.length - 1], { email: incoming && incoming.verified ? incoming.vemail : undefined, user: incoming && incoming.verified ? incoming.user : undefined, spk: incoming && incoming.vspk, verified: !!(incoming && incoming.verified) })
   const memberEntry = cont ? null : log[log.length - 1] // a continuation adds no member message
   // A message CERTAIN to stay quiet — the assistant muted, or On demand with no @-mention — and with nothing to describe:
   // its turn completes with this write. So the "turn completed" mark rides the same append (no second read-and-rewrite of
@@ -851,7 +855,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
         if (out) { replyEntry.cert = out.cert; if (out.certDoc) replyEntry.certDoc = out.certDoc }
       }
     } catch (e) { console.log('  turn certificate failed: ' + String((e && e.message) || e).slice(0, 160)) }
-    log.push(replyEntry)
+    log.push(await frankEntry(room, replyEntry, { agent: true })) // "Report this answer" is provable too: this text came from the assistant here, then
   }
 
   if (descP) await descP // the member-photo captions must be attached before we persist the entry (they ran in parallel with the reply)
