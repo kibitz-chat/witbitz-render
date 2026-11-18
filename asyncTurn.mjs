@@ -685,6 +685,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   // deadline in dataTools.mjs for that.) SPACE_TURN_BUDGET_MS per environment; 240 s under prod's 300 s (it was 120 s under 150 s when written).
   const budgetMs = (Number.isFinite(turnBudgetMs) && turnBudgetMs > 0) ? turnBudgetMs : (Number(process.env.SPACE_TURN_BUDGET_MS) || 120_000)
   let timedOut = false
+  const deadlineAt = Date.now() + budgetMs // the real clock the timer below runs on (`now` may be a test's fixed time)
   const budgetTimer = setTimeout(() => { timedOut = true; console.log(`⏱️ TURN-BUDGET exceeded after ${budgetMs}ms — model call aborted, finalizing with what streamed`); try { abort.abort() } catch { /* */ } }, budgetMs)
   const STOP_POLL_MS = 700
   const pollStop = () => {
@@ -783,6 +784,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
       onDelta,
       onProposed: (p) => { proposedThisTurn.push(p) },
       signal: abort.signal, // STOP: aborting this rejects the model fetch → the tool loop ends; we finalize with the streamed text below
+      deadline: deadlineAt, // the tool loop WRAPS UP before this (toolLoop.mjs): no more tools, an answer with what it has — before the budget aborts it
       onCitations: (cites) => { for (const c of (cites || [])) sources.push(c) },
       ...(builder ? { framing: 'builder' } : {}),
       ...(showPrompt ? { onPrompt: (p) => { sentPrompt = p } } : {}),

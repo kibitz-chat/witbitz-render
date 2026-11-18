@@ -906,7 +906,7 @@ export async function getTurnFlag(room) {
 // no longer free a newer turn's claim). It outlives the longest turn: the Lambda's 300 s timeout (the turn budget is
 // 240 s, the enclave's kill 260 s), so a live turn never loses it and a crashed one frees the room within ~5½ minutes.
 // Same object as the flag (`memory/_turnflag/<room>.json`), so getTurnFlag still reads it.
-export const TURN_LEASE_MS = 330000
+export const TURN_LEASE_MS = 930000 // outlives the longest turn: the 900 s Lambda (2026-11-18; was 330 s under 300 s)
 /** → { ok:true } (the lease is yours) | { ok:false, busy:true } (a live turn holds it) | { ok:false, reason } (no store
  *  answer — the caller decides; the transport lets the turn run, as the flag always did on a store failure). */
 export async function acquireTurnLease(room, { owner, now = Date.now(), ttlMs = TURN_LEASE_MS } = {}) {
