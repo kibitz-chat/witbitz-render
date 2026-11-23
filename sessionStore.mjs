@@ -103,12 +103,23 @@ async function writeObject(key, body) {
   return ok
 }
 
+// A READ THAT LOST ITS CONNECTION IS TRIED AGAIN (2026-11-22 15:20 UTC: two probe turns in a row answered empty with "worker: ledger
+// unreadable (read_failed · TypeError: fetch failed)" — the enclave's store bridge (infra/enclave/app/main.go serveStore) dials the
+// parent once per connection and closes on a failed dial, and nothing above it retried, so one missed connection failed the turn).
+// Only a /get, only a connection-level failure (fetch threw): a reply — any status, absent included — is the store's answer and is
+// returned as it was. A write is never retried here (a lost reply could hide a write that landed; its callers already refuse safely).
+const READ_RETRY_MS = [100, 400]
+async function remoteRead(key) {
+  for (let i = 0; ; i++) {
+    try { return await fetch(`${REMOTE}/get`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key }) }) }
+    catch (e) { if (i >= READ_RETRY_MS.length) throw e; await new Promise((r) => setTimeout(r, READ_RETRY_MS[i])) }
+  }
+}
+
 /** → the stored string. Throws when absent, matching what S3 and readFile already do; callers treat that as null. */
 async function readObject(key) {
   if (REMOTE) {
-    const r = await fetch(`${REMOTE}/get`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key }),
-    })
+    const r = await remoteRead(key)
     if (!r.ok) throw new Error(`remote get ${r.status}`)
     const j = await r.json()
     if (j.value == null) throw new Error('absent')
@@ -145,7 +156,7 @@ let remoteCasRefused = false // the parent answered 501 cas_unsupported (its S3 
 const LOCAL_TAG = 'local:' // a tag the client computed itself (sha of the bytes) because the parent gave none — never sent as ifMatch
 const stripTag = (t) => (t == null ? null : String(t).replace(LOCAL_TAG, ''))
 async function remoteGetV(key) {
-  const r = await fetch(`${REMOTE}/get`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key }) })
+  const r = await remoteRead(key)
   if (!r.ok) throw new Error(`remote get ${r.status}`)
   const j = await r.json()
   remoteTags = Object.prototype.hasOwnProperty.call(j, 'etag')
