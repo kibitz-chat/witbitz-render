@@ -387,6 +387,11 @@ export async function putLedger(room, snapshot, opts = {}) {
   try {
     const body = await encodeMemory(snapshot) // generic: seals JSON.stringify(snapshot) under the room key
     if (body == null) return false // no room key → never persist
+    if (opts.expectedSnapshot !== undefined) {
+      const cur = await readObjectV(ledgerKey(room))
+      if ((cur.body ?? null) !== opts.expectedSnapshot) return false
+      return writeObjectIf(ledgerKey(room), body, cur.etag)
+    }
     return await writeObject(ledgerKey(room), body)
   } catch (e) {
     console.log('  ledger store failed:', e && e.message)
@@ -403,7 +408,7 @@ export async function putLedger(room, snapshot, opts = {}) {
 // entry's content changed in place — e.g. a member photo gets its describe-once caption attached AFTER it was sealed in
 // the early publish; the append path would keep the stale (caption-less) box forever. Entry order/indices are unchanged,
 // so sinceCount polls are unaffected (same boxes count, re-encrypted plaintext-identical entries).
-async function putLedgerV3(room, snapshot, { done, reseal } = {}) {
+async function putLedgerV3(room, snapshot, { done, reseal, expectedSnapshot } = {}) {
   const mk = getRoomKey()
   if (!mk) return false
   const entries = ledgerEntries(snapshot)
@@ -413,6 +418,7 @@ async function putLedgerV3(room, snapshot, { done, reseal } = {}) {
     try { const v = await readObjectV(ledgerKey(room)); prevRaw = v.body; prevTag = v.etag } catch { prevRaw = null; prevTag = undefined } // fresh room → no prior ledger (undefined tag = could not read: no conditional rebuild)
     const prevHeader = prevRaw != null ? parseV4Header(prevRaw) : null // a segmented ledger: its appends never touch this header (closeGeneration below)
     if (prevRaw != null) prevRaw = await assembleLedger(room, prevRaw) // a v4 room: its boxes, assembled (a missing segment THROWS → no write)
+    if (expectedSnapshot !== undefined && (prevRaw ?? null) !== expectedSnapshot) return false
     let prevBoxes = []
     let prevDone = null
     try { const p = JSON.parse(prevRaw); if (isV3(p)) { prevBoxes = p.boxes; if (Number.isInteger(p.done)) prevDone = p.done } } catch { /* v1/v2/absent → migrate (prevBoxes stays []) */ }
@@ -513,15 +519,15 @@ export async function appendLedger(room, entries, { done, expectCount } = {}) {
   if (!mk) return { ok: false, reason: 'no_key' }
   const add = Array.isArray(entries) ? entries.filter((e) => e && typeof e === 'object') : []
   if (!LEDGER_V3_WRITE) { // legacy whole-body writer: keep its semantics, just serialize the read-modify-write
-    return withKeyLock(ledgerKey(room), async () => {
+    return withKeyLock('append:' + ledgerKey(room), async () => {
       // ABSENT starts empty; UNREADABLE refuses. Writing [...nothing, ...add] over a history this key cannot open replaced
       // the whole room with one line — a turn that began before an in-place re-key (agent/roomRekey.mjs) and answered
       // after it, under the OLD key (2026-10-22, the members suite; the v3/v4 writers keep every box and were never hit)
-      let cur = []
-      try { const d = await readLedgerDefinitive(room); if (!d.ok) return { ok: false, reason: d.reason === 'no_key' ? 'no_key' : 'unreadable' }; cur = d.entries } catch { return { ok: false, reason: 'unreadable' } }
+      let cur = [], snapshot
+      try { const d = await readLedgerDefinitive(room, { withSnapshot: true }); if (!d.ok) return { ok: false, reason: d.reason === 'no_key' ? 'no_key' : 'unreadable' }; cur = d.entries; snapshot = d.snapshot } catch { return { ok: false, reason: 'unreadable' } }
       if (Number.isInteger(expectCount) && cur.length !== expectCount) return { ok: false, reason: 'stale', count: cur.length }
       const next = [...cur, ...add]
-      const ok = await putLedger(room, next, { ...(done === 'all' ? { done: next.length } : Number.isInteger(done) ? { done: Math.min(done, next.length) } : {}) })
+      const ok = await putLedger(room, next, { expectedSnapshot: snapshot, ...(done === 'all' ? { done: next.length } : Number.isInteger(done) ? { done: Math.min(done, next.length) } : {}) })
       return ok ? { ok: true, count: next.length } : { ok: false, reason: 'write_failed' }
     })
   }
@@ -707,7 +713,7 @@ export function ledgerEntries(snapshot) {
  * → { ok: false, reason }   DO NOT WRITE. Fail the turn instead; a failed turn is recoverable, a clobbered ledger
  *                           is not. This is the "definitive-read guard" the index-clobber post-mortem asked for.
  */
-export async function readLedgerDefinitive(room) {
+export async function readLedgerDefinitive(room, { withSnapshot = false } = {}) {
   if (!memoryEnabled() || !PERSISTENT) return { ok: false, reason: 'no_store' }
   if (!hasAnyKey()) return { ok: false, reason: 'no_key' }
   // ★ ABSENT IS NOT A FAILURE, AND EVERY BACKEND SIGNALS IT BY THROWING: the remote store throws 'absent', a local
@@ -722,13 +728,13 @@ export async function readLedgerDefinitive(room) {
   let stored
   try { stored = await readObject(ledgerKey(room)); if (stored != null) stored = await assembleLedger(room, stored) } // a missing v4 segment is read_failed below, never empty
   catch (e) {
-    if (isAbsent(e)) return { ok: true, entries: [] }
+    if (isAbsent(e)) return { ok: true, entries: [], ...(withSnapshot ? { snapshot: null } : {}) }
     // CARRY THE ERROR. The first cut swallowed it and reported a bare 'read_failed', so when the guard fired on
     // every turn there was no way to tell WHICH error shape it had failed to classify. Never discard the evidence
     // that tells you why a fail-closed path is firing.
     return { ok: false, reason: 'read_failed', err: String((e && e.name) || '') + ':' + String((e && e.message) || e).slice(0, 120) }
   }
-  if (stored == null) return { ok: true, entries: [] } // definitively empty
+  if (stored == null) return { ok: true, entries: [], ...(withSnapshot ? { snapshot: null } : {}) } // definitively empty
   let head = null
   try { head = JSON.parse(stored) } catch { /* legacy pre-encryption plaintext — decodeMemory handles it */ }
   try {
@@ -737,7 +743,7 @@ export async function readLedgerDefinitive(room) {
       : ledgerEntries(await decodeMemory(stored))
     // Stored bytes exist but did not open ⇒ a decrypt/parse failure, NOT an empty room. Never let this look empty.
     if (!Array.isArray(entries)) return { ok: false, reason: 'decrypt_failed' }
-    return { ok: true, entries }
+    return { ok: true, entries, ...(withSnapshot ? { snapshot: stored } : {}) }
   } catch (e) { return { ok: false, reason: 'decrypt_failed' } }
 }
 
@@ -1022,16 +1028,21 @@ export async function putDoc(room, name, snapshot) {
  * ⚑ A doc that exists but opens to null (legacy plaintext, a foreign seal) is treated as ABSENT and replaced — the same
  *   "resume clean" rule getDoc → putDoc always applied. Only the RACE is new here, not the recovery policy.
  */
-export async function updateDoc(room, name, mutate, { attempts = 8 } = {}) {
-  if (!memoryEnabled() || !PERSISTENT || !hasAnyKey()) return (await mutate(null)).value // nothing is persisted on this tier: same as getDoc → null
+export async function updateDoc(room, name, mutate, { attempts = 8, requireReadable = false } = {}) {
+  if (!memoryEnabled() || !PERSISTENT || !hasAnyKey()) {
+    if (requireReadable) throw new Error('document store unavailable')
+    return (await mutate(null)).value
+  } // nothing is persisted on this tier: same as getDoc → null
   const key = docKey(room, name)
   for (let i = 0; i < attempts; i++) {
     const { body, etag } = await readObjectV(key)
     let cur = null
     if (body != null) cur = await decodeMemory(body) // null when it cannot be opened ⇒ resume clean, as getDoc does
+    if (requireReadable && body != null && cur == null) throw new Error('unreadable document')
     const { doc, value } = await mutate(cur)
     if (doc === undefined) return value
     const out = await encodeMemory(doc)
+    if (requireReadable && out == null) throw new Error('document could not be saved')
     if (out == null) return value // no room key → never persist (putDoc's rule)
     if (await writeObjectIf(key, out, etag)) return value
     await new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 20) * (1 + Math.min(i, 4)))) // someone wrote first: re-read, re-apply
@@ -1054,14 +1065,21 @@ export async function getDoc(room, name) {
  *  exists but does not open is still null, as in getDoc. */
 /** Is there a durable doc store at all? Without one putDoc answers false by design (dev/no-storage), which is not an outage. */
 export const docStoreOn = () => memoryEnabled() && PERSISTENT
-export async function getDocStrict(room, name) {
-  if (!memoryEnabled() || !PERSISTENT || !hasAnyKey()) return null
+export async function getDocStrict(room, name, { requireReadable = false } = {}) {
+  if (!memoryEnabled() || !PERSISTENT || !hasAnyKey()) {
+    if (requireReadable) throw Object.assign(new Error('document store unavailable'), { code: 'store_unavailable' })
+    return null
+  }
   let stored
   try { stored = await readObject(docKey(room, name)) } catch (e) {
     if (isAbsentErr(e)) return null
     const err = new Error('store_unavailable: ' + ((e && e.message) || e)); err.code = 'store_unavailable'; throw err
   }
-  try { return await decodeMemory(stored) } catch { return null }
+  try {
+    const doc = await decodeMemory(stored)
+    if (requireReadable && stored != null && doc == null) throw new Error('unreadable document')
+    return doc
+  } catch (e) { if (requireReadable) throw e; return null }
 }
 
 // ── Content-blind RAW doc — a named room doc stored AS-IS (no mk sealing, no key gating). For an agent's scoped view:

@@ -291,7 +291,7 @@ const widgetForAgent = (w) => {
 // getDoc, so trimming/compacting the conversation can never drop a widget the room still holds. The itinerary is a
 // singleton and the thing most often discussed, so it is pinned in even past the last-few window — a room with four
 // maps must not cost the agent the plan. Exported + dependency-injected (getDoc) so the invariant is unit-testable.
-export async function widgetContext(room, log, { getDoc: gd = getDoc } = {}) {
+export async function widgetContext(room, log, { getDoc: gd = getDoc, sharedRoom = null } = {}) {
   let widgetCtx = ''
   try {
     const names = []
@@ -319,10 +319,10 @@ export async function widgetContext(room, log, { getDoc: gd = getDoc } = {}) {
   // never been told one exists. The device (which holds BOTH keys, and is already what joins the two rooms) writes a
   // rendering into the LANE as its own sealed doc; this folds that in. Same shape as the location doc below.
   try {
-    const sv = await gd(room, 'sharedviews')
+    const sv = sharedRoom ? await gd(room, 'sharedviews') : null
     // state.text first: `summary` is capped at 400 bytes by op:'state', so reading it truncated the plan mid-day-2.
-    // The fallback keeps working for copies written before this moved.
-    const text = String((sv && sv.state && sv.state.text) || (sv && sv.summary) || '').trim()
+    // An earlier copy without a source is refreshed by the next mirror pass.
+    const text = (sharedRoom && sv?.state?.source === sharedRoom ? String(sv.state.text || '') : '').trim()
     if (text) widgetCtx += `\n[the shared room's views] ${text.slice(0, 12000)}`
   } catch { /* missing/unopenable must never break a turn */ }
   // Fold the shared location (if any) into context so "find dinner near me" resolves to the shared town.
@@ -504,7 +504,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   //   inline (storeAttachments never drops one) — the room must not lose a member's file because S3 hiccuped.
   const mkNow = getRoomKey()
   const [storedImages, storedFiles] = await Promise.all([storeAttachments(room, mkNow, images), storeAttachments(room, mkNow, files)])
-  if (!cont) log.push(prune({ kind: mcp ? 'mcp' : (hasMedia ? 'media' : 'text'), id: memberId, ts: now, name: from, replyTo, mcpName: mcp ? mcp.name : undefined, mcpArgs: mcp ? mcp.args : undefined, verified: incoming && incoming.verified ? true : undefined, attestedClient: incoming && typeof incoming.attestedClient === 'string' && incoming.attestedClient ? incoming.attestedClient : undefined, attestedVersion: incoming && incoming.attestedClient && Number.isInteger(incoming.attestedVersion) ? incoming.attestedVersion : undefined, user: incoming && incoming.verified && typeof incoming.user === 'string' && incoming.user ? incoming.user : undefined, keyOnly: incoming && incoming.verified && incoming.keyOnly === true ? true : undefined, spk: incoming && incoming.vspk ? incoming.vspk : undefined, md: incoming && incoming.md === true ? true : undefined, voice: incoming && incoming.voice && typeof incoming.voice === 'object' ? incoming.voice : undefined, text, images: storedImages.length ? storedImages : undefined, files: storedFiles.length ? storedFiles : undefined, widgets: locWidget ? [locWidget] : undefined }))
+  if (!cont) log.push(prune({ kind: mcp ? 'mcp' : (hasMedia ? 'media' : 'text'), id: memberId, ts: now, name: from, replyTo, mcpName: mcp ? mcp.name : undefined, mcpArgs: mcp ? mcp.args : undefined, verified: incoming && incoming.verified ? true : undefined, emailNameVerified: incoming?.verified && incoming.vemail && String(from).trim().toLowerCase() === String(incoming.vemail).trim().toLowerCase() ? true : undefined, attestedClient: incoming && typeof incoming.attestedClient === 'string' && incoming.attestedClient ? incoming.attestedClient : undefined, attestedVersion: incoming && incoming.attestedClient && Number.isInteger(incoming.attestedVersion) ? incoming.attestedVersion : undefined, user: incoming && incoming.verified && typeof incoming.user === 'string' && incoming.user ? incoming.user : undefined, keyOnly: incoming && incoming.verified && incoming.keyOnly === true ? true : undefined, spk: incoming && incoming.vspk ? incoming.vspk : undefined, md: incoming && incoming.md === true ? true : undefined, voice: incoming && incoming.voice && typeof incoming.voice === 'object' ? incoming.voice : undefined, text, images: storedImages.length ? storedImages : undefined, files: storedFiles.length ? storedFiles : undefined, widgets: locWidget ? [locWidget] : undefined }))
   // PUBLISH the member's message NOW — before the brain runs — so the OTHER participants see it on their next poll instead
   // of waiting for the whole turn (the agent's reply can take many seconds). The reply is stored again at the end. Best-
   // effort: if this store fails, the final putLedger below is still the source of truth.
@@ -567,7 +567,7 @@ async function runAsyncTurnInner(room, incoming, opts = {}) {
   // to change them. Sourced from the FULL log + fresh getDoc (see widgetContext), so it is independent of the compacted
   // conversation window above: trimming/compacting chat never drops a widget the room still holds, and the itinerary is
   // pinned in even past the last-few window. Guarded (key is live here); no widget → empty string.
-  const widgetCtx = quietEarly ? '' : await widgetContext(room, log) // a quiet message runs no model: nothing to fold in
+  const widgetCtx = quietEarly ? '' : await widgetContext(room, log, { sharedRoom: opts.sharedRoom }) // a quiet message runs no model: nothing to fold in
   // SMART CHIME-IN: in a GROUP (2+ distinct human speakers), if the message isn't directly aimed at the agent (no name /
   // @-mention), a DEDICATED cheap gate decides whether it should reply — biased hard to silence, and ISOLATED from the
   // "be helpful" reply framing that otherwise drags it into answering people talking to each other. SILENT → post nothing
